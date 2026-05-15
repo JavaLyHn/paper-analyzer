@@ -31,11 +31,27 @@ import fitz  # PyMuPDF
 import pdfplumber
 
 # Caption patterns. Order matters: more specific first.
+#
+# A real caption MUST be one of:
+#   "Figure 1: Title"   (ACM/IEEE convention — colon)
+#   "Figure 1. Title"   (Springer/Elsevier convention — period)
+#   "Algorithm 1 Title" (no separator, but next token is capitalized)
+#
+# We MUST NOT match body-text references like:
+#   "Fig. 7 provides the full protocol..."  (lowercase after the number)
+#   "as shown in Figure 3 the result..."    (block doesn't start with Figure)
+#
+# The `^\s*` anchor handles the second case; the post-digit `(?:\s*[:.]|\s+[A-Z])`
+# rejects body text where a lowercase word follows the number.
+#
+# IGNORECASE is dropped on purpose: real captions in academic PDFs always use
+# canonical capitalization ("Figure", "Fig.", "Table"). Lowercased "figure 1:"
+# inside body text is almost never a caption.
 CAPTION_PATTERNS = [
-    ("algorithm", re.compile(r"^\s*(?:Algorithm|Alg\.?)\s*(\d+)[\.:\s]", re.IGNORECASE)),
-    ("listing",   re.compile(r"^\s*Listing\s*(\d+)[\.:\s]", re.IGNORECASE)),
-    ("table",     re.compile(r"^\s*Table\s*(\d+)[\.:\s]", re.IGNORECASE)),
-    ("figure",    re.compile(r"^\s*(?:Figure|Fig\.?)\s*(\d+)[\.:\s]", re.IGNORECASE)),
+    ("algorithm", re.compile(r"^\s*(?:Algorithm|Alg\.?)\s+(\d+)(?:\s*[:.]|\s+[A-Z])")),
+    ("listing",   re.compile(r"^\s*Listing\s+(\d+)(?:\s*[:.]|\s+[A-Z])")),
+    ("table",     re.compile(r"^\s*Table\s+(\d+)(?:\s*[:.]|\s+[A-Z])")),
+    ("figure",    re.compile(r"^\s*(?:Figure|Fig\.?)\s+(\d+)(?:\s*[:.]|\s+[A-Z])")),
 ]
 
 # Maximum fraction of page height to look above/below a caption for the asset.
@@ -63,10 +79,29 @@ BODY_TEXT_MIN_CHARS = 100
 # excluded.
 BODY_TEXT_MIN_WIDTH_FRAC = 0.75
 
-# Anything within this many points from the top of the page is assumed to be
-# the page header (conference info, paper title, page number, etc.) and acts
-# as a hard upper bound on the asset region.
-PAGE_HEADER_BAND = 80.0
+# A conservative minimum upper bound (in points from page top) — used when
+# we cannot detect any obvious page header on the current page. We intentionally
+# keep this small so it doesn't eat the first row of an asset that starts very
+# near the top of the page; the actual header band is detected per-page by
+# `_page_header_y` below.
+PAGE_HEADER_BAND_MIN = 30.0
+
+# Any text block whose bottom y is below this threshold is considered a
+# candidate for being part of the page header (running title, page number,
+# conference info). This is well above the typical page-header band of
+# ~20-40pt but below where the first real body content typically begins
+# (~70-85pt in most templates).
+PAGE_HEADER_CANDIDATE_MAX_Y = 75.0
+
+# When looking above a figure caption for the figure's body via vector
+# drawings (protocol boxes, chart frames, etc.), how far up to scan. Beyond
+# this the drawing is likely from a different figure or page artifact.
+DRAWING_LOOKUP_MAX_GAP = 350.0
+
+# Minimum width/height of a drawing rect for it to count as "the figure"
+# (filters out single lines, axis ticks, tiny markers).
+MIN_DRAWING_W = 40.0
+MIN_DRAWING_H = 20.0
 
 
 @dataclass
@@ -203,6 +238,125 @@ def _detect_column_width(all_blocks: list[tuple], page_w: float) -> float:
     return widths[len(widths) // 2]
 
 
+def _page_header_y(all_blocks: list[tuple]) -> float:
+    """Return the y at which body content begins (below any page header).
+
+    A page header is the running-title / page-number / venue band at the very
+    top of every page (e.g. "CCS '25, October 13-17, 2025, Taipei", "USENIX
+    Association ... 2043"). We must NOT extend an asset region into that band.
+
+    Heuristic: any text block whose *bottom* sits within
+    PAGE_HEADER_CANDIDATE_MAX_Y of the page top is part of the page header.
+    Real body content (tables, figure boxes, prose) typically begins at
+    y >= 75 in single-column layouts and y >= 85 in two-column ones. If no
+    such block exists, return PAGE_HEADER_BAND_MIN so we don't crop the
+    first row of an asset that starts very near the top.
+    """
+    bottom = 0.0
+    for b in all_blocks:
+        _, by0, _, by1, text, *_ = b
+        if not (text or "").strip():
+            continue
+        if by1 < PAGE_HEADER_CANDIDATE_MAX_Y:
+            bottom = max(bottom, by1)
+    if bottom > 0:
+        return bottom + GAP_THRESHOLD
+    return PAGE_HEADER_BAND_MIN
+
+
+def _drawings_in_column_near_caption(
+    page: fitz.Page,
+    cap_bbox: tuple,
+    column: tuple[float, float] | None,
+    direction: str,
+    y_limit: float | None = None,
+) -> fitz.Rect | None:
+    """Return the bounding rect of all vector drawings that form the figure body.
+
+    Many figures in academic PDFs have a vector-drawn border or frame:
+    protocol pseudocode boxes have a rectangle border, charts have an axis
+    frame, system diagrams have boxes connected by arrows. PyMuPDF's
+    `page.get_drawings()` exposes these directly — and they are far more
+    reliable for figure-extent detection than text-block boundary heuristics,
+    which mistake the figure's own pseudocode lines for body prose.
+
+    Strategy:
+      * Look at drawings on the same side (above for caption-below figures,
+        below for caption-above figures).
+      * Drawing must overlap caption's column horizontally — this prevents
+        the right-column figure from grabbing the left-column figure's box.
+      * Drawing must be within DRAWING_LOOKUP_MAX_GAP of the caption — beyond
+        that it likely belongs to a different figure.
+      * Drawing must be at least MIN_DRAWING_W × MIN_DRAWING_H — filters out
+        thin underlines, single-line strokes, axis ticks.
+      * Union all qualifying drawings into one rect.
+
+    Returns None if no qualifying drawings are found (e.g. a photo-only
+    figure with no vector content, or a stub figure).
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return None
+
+    cx0, cy0, cx1, cy1 = cap_bbox
+    cap_cx = (cx0 + cx1) / 2
+
+    rects: list[fitz.Rect] = []
+    for d in drawings:
+        r = d.get("rect") if isinstance(d, dict) else None
+        if r is None:
+            continue
+        w = r.x1 - r.x0
+        h = r.y1 - r.y0
+        if w < MIN_DRAWING_W or h < MIN_DRAWING_H:
+            continue
+
+        if direction == "above":
+            # caption is below the figure — drawing must end above caption top
+            if r.y1 > cy0 + 1:
+                continue
+            if r.y1 < cy0 - DRAWING_LOOKUP_MAX_GAP:
+                continue
+            # y_limit (if given) bounds how far up we look — e.g. another
+            # caption above this one fences off its own figure's drawings.
+            # If the drawing crosses that limit, skip it entirely.
+            if y_limit is not None and r.y0 < y_limit:
+                continue
+        else:  # "below"
+            # caption is above the figure — drawing must start below caption bottom
+            if r.y0 < cy1 - 1:
+                continue
+            if r.y0 > cy1 + DRAWING_LOOKUP_MAX_GAP:
+                continue
+            if y_limit is not None and r.y1 > y_limit:
+                continue
+
+        # Column constraint: the drawing must overlap the caption's column.
+        # We accept either "caption center is inside drawing" OR "drawing
+        # significantly overlaps caption width" — the first handles cases
+        # where the figure is wider than the caption, the second handles
+        # narrow figures.
+        if column is not None:
+            col_l, col_r = column
+            if r.x0 >= col_r - 5 or r.x1 <= col_l + 5:
+                continue
+        else:
+            if r.x1 < cap_cx - 200 or r.x0 > cap_cx + 200:
+                continue
+
+        rects.append(r)
+
+    if not rects:
+        return None
+
+    x0 = min(r.x0 for r in rects)
+    y0 = min(r.y0 for r in rects)
+    x1 = max(r.x1 for r in rects)
+    y1 = max(r.y1 for r in rects)
+    return fitz.Rect(x0, y0, x1, y1)
+
+
 def _looks_like_caption(text: str) -> bool:
     """Return True if a text block starts with a Figure/Table/Algorithm/Listing N caption."""
     stripped = (text or "").strip()
@@ -221,66 +375,144 @@ def asset_region(
 ) -> fitz.Rect:
     """Compute the page region that likely contains the asset.
 
-    Boundary detection — only these four kinds of regions fence in the
-    asset region; everything else (narrow labels, math/pseudocode lines,
-    chart annotations) is assumed to be part of the asset itself:
+    Strategy by kind:
 
-      1. **Other captions** in the same column (Figure 9 caption above
-         Figure 10's region, etc.)
+    * **figure** — caption is typically *below* the figure. We try to find
+      the figure body via `page.get_drawings()` first (protocol boxes,
+      chart frames, diagram lines). If a drawing in the caption's column
+      sits just above the caption, its top is the figure top.
+    * **algorithm/listing** — caption typically *above* the pseudocode.
+      Same drawing-based detection but looking *below* the caption.
+    * **table** — caption can be above (Springer/ACM newer) or below
+      (ACM older / Springer). Pick whichever side has the larger gap to
+      non-table content.
+
+    Boundary detection — these mark where a non-asset region ends or begins:
+      1. **Other captions** in the same column.
       2. **Real body-text paragraphs** — wide (>=75% of column) AND long
-         (>=100 chars) AND paragraph-like (avg line >= 40 chars). These
-         are clearly prose, not figure content.
-      3. **Page header band** — top PAGE_HEADER_BAND points of the page,
-         used as a hard upper bound for figures.
-      4. **Other pdfplumber tables** on the page — their bboxes mark
-         regions claimed by other captions, so a figure above them
-         shouldn't extend into that data, and vice versa.
+         (>=100 chars) AND paragraph-like (avg line >= 40 chars). But
+         blocks that lie *inside* a large vector-drawing rect are figure
+         content, NOT body prose — they're skipped.
+      3. **Page header band** — top PAGE_HEADER_BAND points of the page.
+      4. **Other pdfplumber tables** on the page.
 
-    For figures we walk up; for algorithm/listing we walk down; for tables
-    we extend in whichever direction has the larger natural gap.
+    Drawings dominate boundary detection for figures because the figure's
+    own pseudocode/text lines used to be incorrectly classified as body
+    prose, fencing the figure off from its caption.
     """
     page_h = page.rect.height
     page_w = page.rect.width
     x0, y0, x1, y1 = caption.bbox
     cap_x_range = (x0, x1)
     cap_w = x1 - x0
+    cap_center = (x0 + x1) / 2
 
-    # Column layout detection — by inspecting paragraph blocks, NOT caption width.
+    # Column layout detection.
     column_width = _detect_column_width(all_blocks, page_w)
+    columns = _detect_text_columns(all_blocks, page_w)
     two_column = column_width < page_w * 0.65
     spans_columns = cap_w > column_width * 1.1
+
+    # The column containing this caption (used as horizontal clipping bound).
+    caption_col: tuple[float, float] | None = None
+    for cl, cr in columns:
+        if cl <= cap_center <= cr:
+            caption_col = (cl, cr)
+            break
+    if caption_col is not None:
+        col_w = caption_col[1] - caption_col[0]
+        if cap_w > col_w * 0.9:
+            # Wide caption — figure is a full-width float across both columns.
+            caption_col = (0.0, page_w)
+
+    # Initial horizontal extent.
     if two_column and not spans_columns:
-        # Single-column-wide caption on a 2-column page → asset is in one column.
         left = max(0, x0 - 6)
         right = min(page_w, x1 + 6)
     elif two_column and spans_columns:
-        # Caption is wider than one column on a 2-column page → asset is a
-        # full-width float (typical for big tables and wide figures).
         left = 0
         right = page_w
     else:
-        # Single-column page — center on the caption but use the dominant
-        # content width as the horizontal extent.
-        cap_center = (x0 + x1) / 2
         half = max(column_width / 2 + 10, cap_w / 2 + 10)
         left = max(0, cap_center - half)
         right = min(page_w, cap_center + half)
 
-    # Collect candidate boundaries (their y_bottom values for "above the asset"
-    # and y_top values for "below the asset").
-    boundaries_above: list[float] = []  # y_bottom of blocks above the caption
-    boundaries_below: list[float] = []  # y_top of blocks below the caption
+    # Cache all drawings on the page (used for both vertical extent and
+    # "is this block inside a figure" check).
+    try:
+        all_drawings_raw = page.get_drawings()
+    except Exception:
+        all_drawings_raw = []
+    big_drawings: list[fitz.Rect] = []
+    for d in all_drawings_raw:
+        r = d.get("rect") if isinstance(d, dict) else None
+        if r is None:
+            continue
+        if (r.x1 - r.x0) < MIN_DRAWING_W or (r.y1 - r.y0) < MIN_DRAWING_H:
+            continue
+        big_drawings.append(r)
 
-    def consider_boundary(by0: float, by1: float, bx0: float, bx1: float) -> None:
-        # Only counts if it overlaps the caption's column horizontally.
-        if _overlap_fraction_of(cap_x_range, (bx0, bx1)) < 0.3:
+    def block_inside_drawing(bx0_: float, by0_: float, bx1_: float, by1_: float) -> bool:
+        """True if the block's center sits inside any large vector-drawn rect.
+
+        Such blocks are figure content (pseudocode steps, chart annotations,
+        diagram labels) and must NOT count as body-text boundaries.
+        """
+        bcx = (bx0_ + bx1_) / 2
+        bcy = (by0_ + by1_) / 2
+        for r in big_drawings:
+            if r.x0 - 2 <= bcx <= r.x1 + 2 and r.y0 - 2 <= bcy <= r.y1 + 2:
+                return True
+        return False
+
+    # Drawing-based vertical extent — strong signal for figures with a frame.
+    # We bound the drawing search by the nearest other caption on the same
+    # column: if another figure's caption sits above ours, its body fills the
+    # space between the two captions and must not be swallowed.
+    nearest_caption_above_y: float | None = None
+    nearest_caption_below_y: float | None = None
+    for other in captions_on_page:
+        if other is caption:
+            continue
+        if other.kind == caption.kind and other.number == caption.number:
+            continue
+        # Only consider captions whose horizontal extent overlaps this caption's
+        # column — captions in the other column don't fence us off.
+        if _overlap_fraction_of(cap_x_range, (other.bbox[0], other.bbox[2])) < 0.3:
+            continue
+        if other.bbox[3] < y0 - GAP_THRESHOLD:
+            if nearest_caption_above_y is None or other.bbox[3] > nearest_caption_above_y:
+                nearest_caption_above_y = other.bbox[3]
+        elif other.bbox[1] > y1 + GAP_THRESHOLD:
+            if nearest_caption_below_y is None or other.bbox[1] < nearest_caption_below_y:
+                nearest_caption_below_y = other.bbox[1]
+
+    drawing_above = None
+    drawing_below = None
+    if caption.kind == "figure":
+        drawing_above = _drawings_in_column_near_caption(
+            page, caption.bbox, caption_col, "above",
+            y_limit=nearest_caption_above_y,
+        )
+    elif caption.kind in ("algorithm", "listing"):
+        drawing_below = _drawings_in_column_near_caption(
+            page, caption.bbox, caption_col, "below",
+            y_limit=nearest_caption_below_y,
+        )
+
+    # Standard boundary detection (for cases without a drawing frame).
+    boundaries_above: list[float] = []
+    boundaries_below: list[float] = []
+
+    def consider_boundary(by0_: float, by1_: float, bx0_: float, bx1_: float) -> None:
+        if _overlap_fraction_of(cap_x_range, (bx0_, bx1_)) < 0.3:
             return
-        if by1 <= y0 - GAP_THRESHOLD:
-            boundaries_above.append(by1)
-        elif by0 >= y1 + GAP_THRESHOLD:
-            boundaries_below.append(by0)
+        if by1_ <= y0 - GAP_THRESHOLD:
+            boundaries_above.append(by1_)
+        elif by0_ >= y1 + GAP_THRESHOLD:
+            boundaries_below.append(by0_)
 
-    # (1) Other captions on this page
+    # (1) Other captions
     for other in captions_on_page:
         if other is caption:
             continue
@@ -288,139 +520,139 @@ def asset_region(
             continue
         consider_boundary(other.bbox[1], other.bbox[3], other.bbox[0], other.bbox[2])
 
-    # (2) Real body-text paragraphs
-    for bx0, by0, bx1, by1, btext, *_ in all_blocks:
+    # (2) Real body-text paragraphs (skip blocks inside drawings)
+    for bx0_, by0_, bx1_, by1_, btext, *_ in all_blocks:
         stripped = (btext or "").strip()
         if len(stripped) < BODY_TEXT_MIN_CHARS:
             continue
-        if (bx1 - bx0) < column_width * BODY_TEXT_MIN_WIDTH_FRAC:
+        if (bx1_ - bx0_) < column_width * BODY_TEXT_MIN_WIDTH_FRAC:
             continue
         if _looks_like_caption(stripped):
-            continue  # captions are handled in step (1); don't double-count
+            continue
         if not _is_paragraph_like(stripped):
-            continue  # table rows / pseudocode blocks of stacked cells
-        consider_boundary(by0, by1, bx0, bx1)
+            continue
+        if block_inside_drawing(bx0_, by0_, bx1_, by1_):
+            continue
+        consider_boundary(by0_, by1_, bx0_, bx1_)
 
-    # (3) Page header band — hard upper bound (only as "above" boundary).
-    boundaries_above.append(PAGE_HEADER_BAND)
+    # (3) Page header band (dynamic — depends on whether this page has a
+    # running-title band at the very top).
+    header_y = _page_header_y(all_blocks)
+    boundaries_above.append(header_y)
 
-    # (4) Other pdfplumber tables on this page (regions claimed by other captions).
+    # (4) Other pdfplumber tables
     for tb in other_table_bboxes:
-        tb_x0, tb_y0, tb_x1, tb_y1 = tb
-        consider_boundary(tb_y0, tb_y1, tb_x0, tb_x1)
+        consider_boundary(tb[1], tb[3], tb[0], tb[2])
 
     max_span = page_h * LOOKUP_FRACTION
 
     def resolve_top() -> float:
         if not boundaries_above:
             return max(0, y0 - max_span)
-        nearest = max(boundaries_above)
-        return min(y0, nearest + GAP_THRESHOLD / 2)
+        return min(y0, max(boundaries_above) + GAP_THRESHOLD / 2)
 
     def resolve_bot() -> float:
         if not boundaries_below:
             return min(page_h, y1 + max_span)
-        nearest = min(boundaries_below)
-        return max(y1, nearest - GAP_THRESHOLD / 2)
+        return max(y1, min(boundaries_below) - GAP_THRESHOLD / 2)
 
+    # Settle vertical extent.
     if caption.kind == "figure":
-        top = resolve_top()
+        if drawing_above is not None:
+            # Drawings win — they directly bound the figure's body.
+            top = max(header_y, drawing_above.y0 - 4)
+            # Respect boundary blocks that sit in the GAP between the drawing
+            # and the caption (e.g. a section header in the gap). Boundaries
+            # whose y is INSIDE the drawing's vertical span belong to the
+            # figure itself (pseudocode steps, axis labels, pdfplumber
+            # mis-detecting the chart as a table) and must be ignored.
+            for b in boundaries_above:
+                if drawing_above.y1 < b < y0:
+                    top = max(top, b + GAP_THRESHOLD / 2)
+        else:
+            top = resolve_top()
         bot = y1 + 4
     elif caption.kind in ("algorithm", "listing"):
+        if drawing_below is not None:
+            bot = min(page_h, drawing_below.y1 + 4)
+            for b in boundaries_below:
+                if y1 < b < drawing_below.y0:
+                    bot = min(bot, b - GAP_THRESHOLD / 2)
+        else:
+            bot = resolve_bot()
         top = max(0, y0 - 4)
-        bot = resolve_bot()
-    else:  # table — pick the side with the larger gap
-        top_candidate = resolve_top()
-        bot_candidate = resolve_bot()
-        gap_above = y0 - top_candidate
-        gap_below = bot_candidate - y1
-        if gap_above >= gap_below:
-            top = top_candidate
+    else:  # table — pick the side with the larger gap to non-table content
+        top_c = resolve_top()
+        bot_c = resolve_bot()
+        if (y0 - top_c) >= (bot_c - y1):
+            top = top_c
             bot = y1 + 4
         else:
             top = max(0, y0 - 4)
-            bot = bot_candidate
+            bot = bot_c
 
-    # For figures (and algorithm/listing code blocks) the caption can be
-    # narrower than the asset itself — e.g. a centered "Figure N: …" caption
-    # under a wide protocol diagram, or a short "Algorithm N" caption above a
-    # full-column pseudocode block. After the vertical range is settled, sweep
-    # the page for non-prose content that sits inside that range and widen the
-    # horizontal extent. Two safety nets keep this from leaking sideways:
-    #   * **column limit** — the asset stays inside the column its caption
-    #     sits in, unless the caption itself is wider than the column (then
-    #     it's a full-width float and we allow the full page).
-    #   * **forbidden body strips** — if a drawing or label still extends
-    #     into a vertically-overlapping body-text column (e.g. a cloud-shaped
-    #     figure on page 3 that crosses into prose), clip back to the strip's
-    #     edge so the crop doesn't render partial letters of the prose.
+    # Horizontal expansion (figures + algorithm + listing): a narrow caption
+    # under a wide protocol diagram is common. Sweep non-prose content within
+    # (top, bot) and widen, with column-clipping and forbidden-strip safety.
     if caption.kind in ("figure", "algorithm", "listing"):
-        columns = _detect_text_columns(all_blocks, page_w)
-        cap_center = (x0 + x1) / 2
-        cap_w_local = x1 - x0
-        caption_col: tuple[float, float] | None = None
-        for cl, cr in columns:
-            if cl <= cap_center <= cr:
-                caption_col = (cl, cr)
-                break
-        if caption_col is not None:
-            col_w = caption_col[1] - caption_col[0]
-            if cap_w_local > col_w * 0.9:
-                caption_col = (0.0, page_w)
+        # Seed from the dominant drawing if we have one (gives a tight start).
+        if drawing_above is not None:
+            left = min(left, drawing_above.x0)
+            right = max(right, drawing_above.x1)
+        if drawing_below is not None:
+            left = min(left, drawing_below.x0)
+            right = max(right, drawing_below.x1)
 
+        # Forbidden strips: prose columns vertically overlapping (top, bot).
         forbidden_strips: list[tuple[float, float]] = []
-        for bx0, by0, bx1, by1_, btext, *_ in all_blocks:
+        for bx0_, by0_, bx1_, by1_, btext, *_ in all_blocks:
             stripped = (btext or "").strip()
             if not stripped:
                 continue
             if (
                 len(stripped) >= BODY_TEXT_MIN_CHARS
-                and (bx1 - bx0) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
+                and (bx1_ - bx0_) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
                 and _is_paragraph_like(stripped)
                 and not _looks_like_caption(stripped)
+                and not block_inside_drawing(bx0_, by0_, bx1_, by1_)
                 and by1_ > top
-                and by0 < bot
+                and by0_ < bot
             ):
-                forbidden_strips.append((bx0, bx1))
+                forbidden_strips.append((bx0_, bx1_))
 
-        for bx0, by0, bx1, by1_, btext, *_ in all_blocks:
+        # Expand to non-prose blocks within the vertical range.
+        for bx0_, by0_, bx1_, by1_, btext, *_ in all_blocks:
             stripped = (btext or "").strip()
             if not stripped:
                 continue
-            bcy = (by0 + by1_) / 2
+            bcy = (by0_ + by1_) / 2
             if not (top - 2 <= bcy <= bot + 2):
                 continue
             if (
                 len(stripped) >= BODY_TEXT_MIN_CHARS
-                and (bx1 - bx0) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
+                and (bx1_ - bx0_) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
                 and _is_paragraph_like(stripped)
                 and not _looks_like_caption(stripped)
+                and not block_inside_drawing(bx0_, by0_, bx1_, by1_)
             ):
                 continue
-            left = min(left, bx0)
-            right = max(right, bx1)
+            left = min(left, bx0_)
+            right = max(right, bx1_)
 
-        try:
-            drawings = page.get_drawings()
-        except Exception:
-            drawings = []
-        for d in drawings:
-            r = d.get("rect") if isinstance(d, dict) else None
-            if r is None:
-                continue
-            dx0, dy0, dx1, dy1 = r.x0, r.y0, r.x1, r.y1
-            if dx1 - dx0 <= 0 or dy1 - dy0 <= 0:
-                continue
-            bcy = (dy0 + dy1) / 2
+        # Expand to drawings within the vertical range.
+        for r in big_drawings:
+            bcy = (r.y0 + r.y1) / 2
             if not (top - 2 <= bcy <= bot + 2):
                 continue
-            left = min(left, dx0)
-            right = max(right, dx1)
+            left = min(left, r.x0)
+            right = max(right, r.x1)
 
+        # Clip to caption's column.
         if caption_col is not None:
             left = max(left, caption_col[0])
             right = min(right, caption_col[1])
 
+        # Clip out of forbidden strips.
         left_clipped = False
         right_clipped = False
         for fx0, fx1 in forbidden_strips:
@@ -484,16 +716,22 @@ def _is_real_table(t: dict, page_h: float, page_w: float) -> bool:
     """Reject pdfplumber `tables` that are noise (chart axes, off-page boxes).
 
     pdfplumber can mistake chart axis labels for tables — the rotated y-axis
-    labels and x-tick values get clustered into "cells" with many `\\n`s in
-    one cell ("0.200 stsoc Git-crypt\\n0.175 Trivial-enc-sign\\n…"). It can
-    also report bboxes with negative / off-page coordinates.
+    labels and x-tick values get clustered into "cells" with many `\\n`s, or
+    fragmented across columns ("Lo\\nC", "cal\\nollabor", …). It can also
+    report bboxes with negative / off-page coordinates, or detect a faintly-
+    gridded chart background as a 7-row table where only the legend area
+    (rows 0-2) has any content and rows 3-6 are blank.
 
     Filter rules:
-      * bbox must be within the page
-      * bbox must be at least 30x10
-      * at least 2 non-empty cells (data, not just whitespace)
-      * non-empty cell fraction >= 20% (real tables have most cells filled)
-      * no cell has >= 4 newlines (chart-label stacks)
+      * bbox must be within the page.
+      * bbox must be at least 30 × 10 points.
+      * at least 2 non-empty cells (data, not just whitespace).
+      * non-empty cell fraction >= 20% (real tables have most cells filled).
+      * no cell has >= 4 newlines (chart-label stacks).
+      * for tables with > 2 rows, at most half the rows can be completely
+        empty (charts have a sparse legend area + many empty grid rows).
+      * word-fragment heuristic: real tables don't split words across cells,
+        so reject if many cells END or START mid-word (e.g. "Lo", "cal").
     """
     x0, y0, x1, y1 = t["bbox"]
     if y1 <= 0 or y0 >= page_h or x1 <= 0 or x0 >= page_w:
@@ -513,7 +751,41 @@ def _is_real_table(t: dict, page_h: float, page_w: float) -> bool:
         for c in row:
             if c and c.count("\n") >= 4:
                 return False
+
+    if len(data) > 2:
+        empty_rows = sum(1 for row in data if all(not (c and c.strip()) for c in row))
+        if empty_rows / len(data) > 0.5:
+            return False
+
+    # Word-fragment check: in a chart-mistaken-as-table, cells often contain
+    # word fragments like "Lo\nC" or "cal\nollabor" where a word ("Local",
+    # "Collaborative") got split across columns. Heuristic: lowercase-starting
+    # short cells next to a previous cell on the same row are suspicious.
+    fragment_hits = 0
+    for row in data:
+        prev_nonempty = False
+        for c in row:
+            if not c:
+                prev_nonempty = False
+                continue
+            s = c.strip()
+            if not s:
+                prev_nonempty = False
+                continue
+            if prev_nonempty and len(s) <= 8 and s[0].islower() and s[0].isalpha():
+                fragment_hits += 1
+            prev_nonempty = True
+    if fragment_hits >= 2:
+        return False
+
     return True
+
+
+# A pdfplumber-detected table is only a valid match for a caption if its
+# vertical distance to the caption is at most this many points. Real
+# captions-table pairs are usually within ~30pt; 100pt covers margins and
+# the rare case of caption-above-table-with-some-blank-space.
+MAX_TABLE_CAPTION_GAP = 100.0
 
 
 def match_table_to_caption(
@@ -577,7 +849,11 @@ def match_table_to_caption(
 
         if best is not None:
             for cap_idx, tab_idx in best[1]:
-                matches[caps[cap_idx].number] = tables[tab_idx]
+                # Sanity check: reject matches where the table is implausibly
+                # far from the caption. A 200pt gap means we're matching across
+                # an unrelated figure or body section.
+                if cost(caps[cap_idx], tables[tab_idx]) <= MAX_TABLE_CAPTION_GAP:
+                    matches[caps[cap_idx].number] = tables[tab_idx]
 
     return matches
 
@@ -672,8 +948,11 @@ def main() -> int:
             #   - if pdfplumber clearly under-detected (its bbox is much
             #     shorter than natural_rect), fall back to the natural region
             #     so the user still gets the full picture.
-            # Then widen horizontally via text-block heuristic to recover
-            # right-edge columns pdfplumber sometimes misses.
+            # Horizontal widening (recover right-edge columns pdfplumber
+            # sometimes misses) is column-aware: we only union with blocks
+            # whose center sits inside the table's current x-range OR within
+            # ~30pt of an edge. This stops a left-column body paragraph from
+            # being sucked into a right-column table.
             if cap.number in table_match:
                 tb = table_match[cap.number]["bbox"]
                 cap_bbox = cap.bbox
@@ -693,14 +972,25 @@ def main() -> int:
                         max(rect.x1, natural_rect.x1),
                         max(rect.y1, natural_rect.y1),
                     )
+                # Column-aware horizontal widening.
                 for bx0, by0, bx1, by1, btext, *_ in blocks:
                     if not (btext or "").strip():
                         continue
                     bcy = (by0 + by1) / 2
-                    if rect.y0 - 2 <= bcy <= rect.y1 + 2:
-                        rect = fitz.Rect(min(rect.x0, bx0), rect.y0,
-                                         max(rect.x1, bx1), rect.y1)
+                    bcx = (bx0 + bx1) / 2
+                    if not (rect.y0 - 2 <= bcy <= rect.y1 + 2):
+                        continue
+                    # Same-column test: block center within current rect's
+                    # x-range (with a small margin) — keeps left-column body
+                    # text out of a right-column table.
+                    if not (rect.x0 - 30 <= bcx <= rect.x1 + 30):
+                        continue
+                    rect = fitz.Rect(min(rect.x0, bx0), rect.y0,
+                                     max(rect.x1, bx1), rect.y1)
             else:
+                # No pdfplumber match — natural_rect drives everything. Don't
+                # widen further: natural_rect already accounts for column
+                # boundaries via asset_region's logic.
                 rect = fitz.Rect(natural_rect)
             rect = fitz.Rect(
                 max(0, rect.x0 - 6),
