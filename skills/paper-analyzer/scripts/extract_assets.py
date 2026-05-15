@@ -24,6 +24,7 @@ import json
 import re
 import sys
 from dataclasses import asdict, dataclass
+from itertools import permutations
 from pathlib import Path
 from typing import Iterable
 
@@ -48,8 +49,25 @@ LOOKUP_FRACTION = 0.7
 # figure/table/algorithm region".
 GAP_THRESHOLD = 6
 
-# Render resolution for PNG snapshots.
-RENDER_DPI = 200
+# Render resolution for PNG snapshots. 300 DPI is the sweet spot between
+# legibility (math symbols, small chart labels) and file size for academic PDFs.
+RENDER_DPI = 300
+
+# A body-text paragraph must be at least this many characters to count as a
+# region boundary above/below a figure. Shorter blocks (pseudocode lines,
+# math expressions, figure labels) are NOT boundaries — they're likely the
+# figure's own content.
+BODY_TEXT_MIN_CHARS = 100
+
+# A body-text paragraph must span at least this fraction of the column width
+# to count as a boundary. Narrow blocks (e.g. labels inside a figure) are
+# excluded.
+BODY_TEXT_MIN_WIDTH_FRAC = 0.75
+
+# Anything within this many points from the top of the page is assumed to be
+# the page header (conference info, paper title, page number, etc.) and acts
+# as a hard upper bound on the asset region.
+PAGE_HEADER_BAND = 80.0
 
 
 @dataclass
@@ -108,111 +126,178 @@ def _overlap_fraction_of(target: tuple, other: tuple) -> float:
     return overlap / target_w
 
 
-def _detect_column_width(page: fitz.Page, all_blocks: list[tuple]) -> float:
-    """Return the dominant content width on the page in points.
+def _is_paragraph_like(text: str) -> bool:
+    """True if the text reads like prose, not a stacked column of short labels.
 
-    Looks at text blocks with paragraph-length content (>= 80 chars) and
-    returns the maximum width among them. Falls back to page width if no
-    paragraph blocks are found.
+    PyMuPDF's `blocks` extractor can join cells of a wide table row into one
+    block (e.g. `"Initialization (KB)\\nOne Version Update/Recovery (KB)\\nGit\\n…"`)
+    or stack pseudocode/chart labels the same way. Such blocks meet the
+    100-char length threshold but they're table content, not body prose, and
+    must NOT be treated as a section boundary — otherwise the table's own
+    header row fences off the table from its caption.
+
+    Heuristic: real prose lines average ~80-110 chars (typical column width);
+    stacked labels average <20. 40 is a conservative cutoff.
     """
-    page_w = page.rect.width
+    lines = [l for l in text.split("\n") if l.strip()]
+    if not lines:
+        return False
+    avg_len = sum(len(l) for l in lines) / len(lines)
+    return avg_len >= 40
+
+
+def _detect_column_width(all_blocks: list[tuple], page_w: float) -> float:
+    """Return the dominant column width on the page in points.
+
+    Looks at paragraph-like text blocks with paragraph-length content
+    (>= BODY_TEXT_MIN_CHARS) and returns the median width among them. Median
+    is more robust than max against outliers like full-width table rows on a
+    2-column page. Stacked-cell blocks are filtered via `_is_paragraph_like`
+    so they don't pull the median up to full-page width.
+    """
     widths = []
     for bx0, _, bx1, _, btext, *_ in all_blocks:
-        if not (btext or "").strip():
+        stripped = (btext or "").strip()
+        if len(stripped) < BODY_TEXT_MIN_CHARS:
             continue
-        if len(btext.strip()) < 80:
+        if not _is_paragraph_like(stripped):
             continue
         widths.append(bx1 - bx0)
     if not widths:
         return page_w * 0.9
-    return max(widths)
+    widths.sort()
+    return widths[len(widths) // 2]
 
 
-def asset_region(page: fitz.Page, caption: Caption, all_blocks: list[tuple]) -> fitz.Rect:
+def _looks_like_caption(text: str) -> bool:
+    """Return True if a text block starts with a Figure/Table/Algorithm/Listing N caption."""
+    stripped = (text or "").strip()
+    for _, pat in CAPTION_PATTERNS:
+        if pat.match(stripped):
+            return True
+    return False
+
+
+def asset_region(
+    page: fitz.Page,
+    caption: Caption,
+    all_blocks: list[tuple],
+    captions_on_page: list[Caption],
+    other_table_bboxes: list[tuple] = (),
+) -> fitz.Rect:
     """Compute the page region that likely contains the asset.
 
-    Strategy: figures are above the caption; algorithm/listing below; tables
-    can be either way, so we probe both directions and use the side with the
-    larger contiguous "non-body" region.
+    Boundary detection — only these four kinds of regions fence in the
+    asset region; everything else (narrow labels, math/pseudocode lines,
+    chart annotations) is assumed to be part of the asset itself:
 
-    "Probing" walks outward from the caption and stops at the nearest text
-    block whose horizontal range overlaps the caption column. That block is
-    presumed to be unrelated body text; the asset lives between the caption
-    and that block.
+      1. **Other captions** in the same column (Figure 9 caption above
+         Figure 10's region, etc.)
+      2. **Real body-text paragraphs** — wide (>=75% of column) AND long
+         (>=100 chars) AND paragraph-like (avg line >= 40 chars). These
+         are clearly prose, not figure content.
+      3. **Page header band** — top PAGE_HEADER_BAND points of the page,
+         used as a hard upper bound for figures.
+      4. **Other pdfplumber tables** on the page — their bboxes mark
+         regions claimed by other captions, so a figure above them
+         shouldn't extend into that data, and vice versa.
 
-    Falls back to a generous LOOKUP_FRACTION window if no boundary is found.
+    For figures we walk up; for algorithm/listing we walk down; for tables
+    we extend in whichever direction has the larger natural gap.
     """
     page_h = page.rect.height
     page_w = page.rect.width
     x0, y0, x1, y1 = caption.bbox
+    cap_x_range = (x0, x1)
     cap_w = x1 - x0
 
-    # Detect column layout by looking at paragraph-length text blocks, not at
-    # the caption width — captions can be narrower than the asset (centered
-    # caption under a full-width figure) or wider than the asset.
-    column_width = _detect_column_width(page, all_blocks)
+    # Column layout detection — by inspecting paragraph blocks, NOT caption width.
+    column_width = _detect_column_width(all_blocks, page_w)
     two_column = column_width < page_w * 0.65
-    if two_column:
+    spans_columns = cap_w > column_width * 1.1
+    if two_column and not spans_columns:
+        # Single-column-wide caption on a 2-column page → asset is in one column.
         left = max(0, x0 - 6)
         right = min(page_w, x1 + 6)
+    elif two_column and spans_columns:
+        # Caption is wider than one column on a 2-column page → asset is a
+        # full-width float (typical for big tables and wide figures).
+        left = 0
+        right = page_w
     else:
-        # Single-column page → use the dominant content band, but extend to
-        # at least cover the caption.
+        # Single-column page — center on the caption but use the dominant
+        # content width as the horizontal extent.
         cap_center = (x0 + x1) / 2
         half = max(column_width / 2 + 10, cap_w / 2 + 10)
         left = max(0, cap_center - half)
         right = min(page_w, cap_center + half)
 
-    # Filter blocks to those that look like body text in the caption's column.
-    # A block is "body text" if it spans most of the caption's horizontal range.
-    # Narrow blocks (figure labels, math symbols, page numbers) are excluded
-    # so they don't fence in the asset region.
-    cap_h_range = (x0, x1)
-    relevant_blocks = []
+    # Collect candidate boundaries (their y_bottom values for "above the asset"
+    # and y_top values for "below the asset").
+    boundaries_above: list[float] = []  # y_bottom of blocks above the caption
+    boundaries_below: list[float] = []  # y_top of blocks below the caption
+
+    def consider_boundary(by0: float, by1: float, bx0: float, bx1: float) -> None:
+        # Only counts if it overlaps the caption's column horizontally.
+        if _overlap_fraction_of(cap_x_range, (bx0, bx1)) < 0.3:
+            return
+        if by1 <= y0 - GAP_THRESHOLD:
+            boundaries_above.append(by1)
+        elif by0 >= y1 + GAP_THRESHOLD:
+            boundaries_below.append(by0)
+
+    # (1) Other captions on this page
+    for other in captions_on_page:
+        if other is caption:
+            continue
+        if other.kind == caption.kind and other.number == caption.number:
+            continue
+        consider_boundary(other.bbox[1], other.bbox[3], other.bbox[0], other.bbox[2])
+
+    # (2) Real body-text paragraphs
     for bx0, by0, bx1, by1, btext, *_ in all_blocks:
-        if abs(by0 - y0) < 1 and abs(by1 - y1) < 1:
-            continue  # itself
         stripped = (btext or "").strip()
-        if not stripped:
+        if len(stripped) < BODY_TEXT_MIN_CHARS:
             continue
-        # Block must cover at least 70% of the caption's width to count as
-        # a "body text" boundary. This filters out figure-internal labels.
-        if _overlap_fraction_of(cap_h_range, (bx0, bx1)) < 0.7:
+        if (bx1 - bx0) < column_width * BODY_TEXT_MIN_WIDTH_FRAC:
             continue
-        # Also skip very short text (single short line) — likely a label,
-        # not real body paragraph. 25 chars is a generous cutoff.
-        if len(stripped) < 25:
-            continue
-        relevant_blocks.append((bx0, by0, bx1, by1))
+        if _looks_like_caption(stripped):
+            continue  # captions are handled in step (1); don't double-count
+        if not _is_paragraph_like(stripped):
+            continue  # table rows / pseudocode blocks of stacked cells
+        consider_boundary(by0, by1, bx0, bx1)
+
+    # (3) Page header band — hard upper bound (only as "above" boundary).
+    boundaries_above.append(PAGE_HEADER_BAND)
+
+    # (4) Other pdfplumber tables on this page (regions claimed by other captions).
+    for tb in other_table_bboxes:
+        tb_x0, tb_y0, tb_x1, tb_y1 = tb
+        consider_boundary(tb_y0, tb_y1, tb_x0, tb_x1)
 
     max_span = page_h * LOOKUP_FRACTION
 
-    def boundary_above(reference_top: float) -> float:
-        """Find the bottom edge of the nearest text block strictly above the reference."""
-        candidates = [b for b in relevant_blocks if b[3] <= reference_top - GAP_THRESHOLD]
-        if not candidates:
-            return max(0, reference_top - max_span)
-        nearest = max(candidates, key=lambda b: b[3])
-        # +small margin so we don't include the bottom pixel row of that text
-        return min(reference_top, nearest[3] + GAP_THRESHOLD / 2)
+    def resolve_top() -> float:
+        if not boundaries_above:
+            return max(0, y0 - max_span)
+        nearest = max(boundaries_above)
+        return min(y0, nearest + GAP_THRESHOLD / 2)
 
-    def boundary_below(reference_bot: float) -> float:
-        """Find the top edge of the nearest text block strictly below the reference."""
-        candidates = [b for b in relevant_blocks if b[1] >= reference_bot + GAP_THRESHOLD]
-        if not candidates:
-            return min(page_h, reference_bot + max_span)
-        nearest = min(candidates, key=lambda b: b[1])
-        return max(reference_bot, nearest[1] - GAP_THRESHOLD / 2)
+    def resolve_bot() -> float:
+        if not boundaries_below:
+            return min(page_h, y1 + max_span)
+        nearest = min(boundaries_below)
+        return max(y1, nearest - GAP_THRESHOLD / 2)
 
     if caption.kind == "figure":
-        top = boundary_above(y0)
+        top = resolve_top()
         bot = y1 + 4
     elif caption.kind in ("algorithm", "listing"):
         top = max(0, y0 - 4)
-        bot = boundary_below(y1)
+        bot = resolve_bot()
     else:  # table — pick the side with the larger gap
-        top_candidate = boundary_above(y0)
-        bot_candidate = boundary_below(y1)
+        top_candidate = resolve_top()
+        bot_candidate = resolve_bot()
         gap_above = y0 - top_candidate
         gap_below = bot_candidate - y1
         if gap_above >= gap_below:
@@ -259,15 +344,45 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[dict]:
     return results
 
 
-def table_to_markdown(data: list[list[str | None]]) -> str:
-    """Best-effort 2D list -> markdown table."""
-    if not data:
+_CID_RE = re.compile(r"\(cid:\d+\)")
+
+
+def _clean_cell(cell: str | None) -> str:
+    """Normalize a single cell value: strip, collapse newlines, replace
+    unresolvable PDF glyph IDs (cid:NN) with a question mark so the markdown
+    is still readable.
+    """
+    if not cell:
         return ""
-    # Normalize: replace None with "", strip newlines inside cells
-    norm = [[(c or "").strip().replace("\n", " ") for c in row] for row in data]
-    # Pad rows to max width
+    cleaned = cell.strip().replace("\n", " ").replace("|", "\\|")
+    cleaned = _CID_RE.sub("?", cleaned).strip()
+    return cleaned
+
+
+def table_to_markdown(data: list[list[str | None]]) -> tuple[str, dict]:
+    """Best-effort 2D list -> markdown table.
+
+    Returns (markdown, stats). stats is {'rows', 'cols', 'cid_cells',
+    'total_cells'} so the caller can decide whether to warn that pdfplumber
+    failed to decode many cells.
+    """
+    stats = {"rows": 0, "cols": 0, "cid_cells": 0, "total_cells": 0}
+    if not data:
+        return "", stats
+
+    # Count cid-only cells BEFORE cleaning so we can report them
+    for row in data:
+        for cell in row:
+            stats["total_cells"] += 1
+            if cell and _CID_RE.search(cell):
+                stats["cid_cells"] += 1
+
+    norm = [[_clean_cell(c) for c in row] for row in data]
     width = max(len(row) for row in norm)
     norm = [row + [""] * (width - len(row)) for row in norm]
+    stats["rows"] = len(norm)
+    stats["cols"] = width
+
     header = norm[0]
     body = norm[1:] if len(norm) > 1 else []
     lines = [
@@ -276,7 +391,7 @@ def table_to_markdown(data: list[list[str | None]]) -> str:
     ]
     for row in body:
         lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", stats
 
 
 def extract_text_in_rect(page: fitz.Page, rect: fitz.Rect) -> str:
@@ -284,28 +399,105 @@ def extract_text_in_rect(page: fitz.Page, rect: fitz.Rect) -> str:
     return page.get_text("text", clip=rect)
 
 
-def match_table_to_caption(captions: list[Caption], pdfplumber_tables: list[dict]) -> dict[int, dict]:
-    """For each table caption, find the pdfplumber table on the same page whose
-    bounding box vertically overlaps the asset region. Returns {caption_number: table_record}.
+def _is_real_table(t: dict, page_h: float, page_w: float) -> bool:
+    """Reject pdfplumber `tables` that are noise (chart axes, off-page boxes).
+
+    pdfplumber can mistake chart axis labels for tables — the rotated y-axis
+    labels and x-tick values get clustered into "cells" with many `\\n`s in
+    one cell ("0.200 stsoc Git-crypt\\n0.175 Trivial-enc-sign\\n…"). It can
+    also report bboxes with negative / off-page coordinates.
+
+    Filter rules:
+      * bbox must be within the page
+      * bbox must be at least 30x10
+      * at least 2 non-empty cells (data, not just whitespace)
+      * non-empty cell fraction >= 20% (real tables have most cells filled)
+      * no cell has >= 4 newlines (chart-label stacks)
+    """
+    x0, y0, x1, y1 = t["bbox"]
+    if y1 <= 0 or y0 >= page_h or x1 <= 0 or x0 >= page_w:
+        return False
+    if (x1 - x0) < 30 or (y1 - y0) < 10:
+        return False
+    data = t.get("data") or []
+    if not data:
+        return False
+    total_cells = sum(len(row) for row in data)
+    non_empty = sum(1 for row in data for c in row if c and c.strip())
+    if non_empty < 2:
+        return False
+    if total_cells > 0 and non_empty / total_cells < 0.2:
+        return False
+    for row in data:
+        for c in row:
+            if c and c.count("\n") >= 4:
+                return False
+    return True
+
+
+def match_table_to_caption(
+    captions: list[Caption],
+    pdfplumber_tables: list[dict],
+    doc: fitz.Document,
+) -> dict[int, dict]:
+    """Match each table caption to a pdfplumber table via optimal (minimum
+    total cost) assignment, per page.
+
+    Distance between caption C and table T is the smaller of:
+      - |C.bottom - T.top|   (caption above table — ACM/IEEE convention)
+      - |T.bottom - C.top|   (caption below table — Springer/Elsevier convention)
+
+    Greedy minimum-edge assignment fails when one table sits between two
+    captions: the inner caption is close to BOTH the table above (via
+    gap_above) and the table below (via gap_below), and greedy can lock the
+    wrong pair first. Brute-force enumeration over permutations finds the
+    assignment that minimizes total distance — n is small (per-page), so cost
+    is negligible.
     """
     matches: dict[int, dict] = {}
+
+    # Group by page so different pages don't compete.
+    pages: dict[int, dict] = {}
     for cap in captions:
-        if cap.kind != "table":
+        if cap.kind == "table":
+            pages.setdefault(cap.page, {"caps": [], "tables": []})["caps"].append(cap)
+    for t in pdfplumber_tables:
+        if t["page"] in pages:
+            pages[t["page"]]["tables"].append(t)
+
+    def cost(cap: Caption, t: dict) -> float:
+        c_top, c_bot = cap.bbox[1], cap.bbox[3]
+        t_top, t_bot = t["bbox"][1], t["bbox"][3]
+        return min(abs(c_bot - t_top), abs(t_bot - c_top))
+
+    for page_idx, group in pages.items():
+        caps = group["caps"]
+        page = doc[page_idx]
+        page_h = page.rect.height
+        page_w = page.rect.width
+        tables = [t for t in group["tables"] if _is_real_table(t, page_h, page_w)]
+        if not caps or not tables:
             continue
-        candidates = [t for t in pdfplumber_tables if t["page"] == cap.page]
-        if not candidates:
-            continue
-        cap_top = cap.bbox[1]
-        # pdfplumber bbox is (x0, top, x1, bottom). Find the table whose center
-        # is closest (vertically) to the caption, and ideally above it.
-        def distance(t):
-            t_top, t_bot = t["bbox"][1], t["bbox"][3]
-            t_center = (t_top + t_bot) / 2
-            # Prefer tables above the caption (table_center < cap_top)
-            above_bonus = 0 if t_center < cap_top else 30
-            return abs(t_center - cap_top) + above_bonus
-        best = min(candidates, key=distance)
-        matches[cap.number] = best
+
+        n_caps = len(caps)
+        n_tabs = len(tables)
+        best: tuple | None = None  # (total_cost, [(cap_idx, tab_idx), ...])
+
+        if n_caps <= n_tabs:
+            for perm in permutations(range(n_tabs), n_caps):
+                total = sum(cost(caps[i], tables[perm[i]]) for i in range(n_caps))
+                if best is None or total < best[0]:
+                    best = (total, [(i, perm[i]) for i in range(n_caps)])
+        else:
+            for perm in permutations(range(n_caps), n_tabs):
+                total = sum(cost(caps[perm[j]], tables[j]) for j in range(n_tabs))
+                if best is None or total < best[0]:
+                    best = (total, [(perm[j], j) for j in range(n_tabs)])
+
+        if best is not None:
+            for cap_idx, tab_idx in best[1]:
+                matches[caps[cap_idx].number] = tables[tab_idx]
+
     return matches
 
 
@@ -336,7 +528,7 @@ def main() -> int:
     # Get tables via pdfplumber once (matched per caption below)
     pdfplumber_tables = extract_tables_with_pdfplumber(pdf_path)
     log(f"pdfplumber found {len(pdfplumber_tables)} raw tables")
-    table_match = match_table_to_caption(captions, pdfplumber_tables)
+    table_match = match_table_to_caption(captions, pdfplumber_tables, doc)
 
     manifest: dict = {
         "pdf": str(pdf_path),
@@ -352,45 +544,91 @@ def main() -> int:
     # mention of "Figure 1" in body text) doesn't overwrite the real one.
     produced: dict[str, set[int]] = {"figure": set(), "table": set(), "algorithm": set(), "listing": set()}
 
-    # Cache per-page text blocks (used by the smart cropper).
+    # Cache per-page text blocks and the captions on each page (used by the
+    # smart cropper).
     page_blocks_cache: dict[int, list[tuple]] = {}
+    captions_by_page: dict[int, list[Caption]] = {}
+    for c in captions:
+        captions_by_page.setdefault(c.page, []).append(c)
+
+    # Index pdfplumber tables by page for boundary-detection in asset_region.
+    tables_by_page: dict[int, list[dict]] = {}
+    for t in pdfplumber_tables:
+        page_h = doc[t["page"]].rect.height
+        page_w_t = doc[t["page"]].rect.width
+        if _is_real_table(t, page_h, page_w_t):
+            tables_by_page.setdefault(t["page"], []).append(t)
+
     for cap in captions:
         if cap.number in produced[cap.kind]:
             continue
         page = doc[cap.page]
         if cap.page not in page_blocks_cache:
             page_blocks_cache[cap.page] = page.get_text("blocks")
+        blocks = page_blocks_cache[cap.page]
+        page_w = page.rect.width
 
-        # Tables: prefer pdfplumber's detected bbox, then union with the
-        # horizontal range of every text block on the same page that falls
-        # within the table's vertical span — pdfplumber often underestimates
-        # the table's right edge when right-side columns lack visible borders.
-        if cap.kind == "table" and cap.number in table_match:
-            t = table_match[cap.number]
-            tb = t["bbox"]  # (x0, top, x1, bottom)
-            cx0, cy0, cx1, cy1 = cap.bbox
-            page_w = page.rect.width
-            top = min(cy0, tb[1]) - 4
-            bot = max(cy1, tb[3]) + 4
-            left = min(cx0, tb[0])
-            right = max(cx1, tb[2])
-            # Widen using text blocks that sit inside the table's vertical band.
-            for bx0, by0, bx1, by1, btext, *_ in page_blocks_cache[cap.page]:
-                if not (btext or "").strip():
-                    continue
-                # Block's vertical center is inside the table band
-                bcy = (by0 + by1) / 2
-                if tb[1] - 2 <= bcy <= tb[3] + 2:
-                    left = min(left, bx0)
-                    right = max(right, bx1)
+        # Other tables on this page act as boundaries — but don't count THIS
+        # caption's matched table against itself.
+        matched_id = id(table_match[cap.number]) if cap.number in table_match else None
+        other_table_bboxes = [
+            tuple(t["bbox"]) for t in tables_by_page.get(cap.page, [])
+            if id(t) != matched_id
+        ]
+
+        # For every kind, get the natural region using caption-aware boundaries.
+        natural_rect = asset_region(
+            page, cap, blocks, captions_by_page[cap.page], other_table_bboxes
+        )
+
+        if cap.kind == "table":
+            # When pdfplumber found the table, trust its bbox for the table's
+            # vertical extent. Earlier we unioned with natural_rect to recover
+            # under-detection, but natural_rect can also LEAK into a neighbor
+            # table or a figure on the same page — making one PNG swallow two
+            # assets. Instead:
+            #   - default: caption bbox ∪ pdfplumber table bbox (tight)
+            #   - if pdfplumber clearly under-detected (its bbox is much
+            #     shorter than natural_rect), fall back to the natural region
+            #     so the user still gets the full picture.
+            # Then widen horizontally via text-block heuristic to recover
+            # right-edge columns pdfplumber sometimes misses.
+            if cap.number in table_match:
+                tb = table_match[cap.number]["bbox"]
+                cap_bbox = cap.bbox
+                rect = fitz.Rect(
+                    min(cap_bbox[0], tb[0]),
+                    min(cap_bbox[1], tb[1]),
+                    max(cap_bbox[2], tb[2]),
+                    max(cap_bbox[3], tb[3]),
+                )
+                pdfplumber_h = tb[3] - tb[1]
+                natural_h = natural_rect.y1 - natural_rect.y0
+                if natural_h > 0 and pdfplumber_h < natural_h * 0.35:
+                    # pdfplumber under-detected — expand to natural region.
+                    rect = fitz.Rect(
+                        min(rect.x0, natural_rect.x0),
+                        min(rect.y0, natural_rect.y0),
+                        max(rect.x1, natural_rect.x1),
+                        max(rect.y1, natural_rect.y1),
+                    )
+                for bx0, by0, bx1, by1, btext, *_ in blocks:
+                    if not (btext or "").strip():
+                        continue
+                    bcy = (by0 + by1) / 2
+                    if rect.y0 - 2 <= bcy <= rect.y1 + 2:
+                        rect = fitz.Rect(min(rect.x0, bx0), rect.y0,
+                                         max(rect.x1, bx1), rect.y1)
+            else:
+                rect = fitz.Rect(natural_rect)
             rect = fitz.Rect(
-                max(0, left - 8),
-                top,
-                min(page_w, right + 8),
-                bot,
+                max(0, rect.x0 - 6),
+                rect.y0,
+                min(page_w, rect.x1 + 6),
+                rect.y1,
             )
         else:
-            rect = asset_region(page, cap, page_blocks_cache[cap.page])
+            rect = natural_rect
 
         if cap.kind == "figure":
             png_path = out_dir / "figures" / f"figure-{cap.number}.png"
@@ -407,19 +645,45 @@ def main() -> int:
             md_path = out_dir / "tables" / f"table-{cap.number}.md"
             render_region(page, rect, png_path)
             md_content = ""
+            md_stats = {"rows": 0, "cols": 0, "cid_cells": 0, "total_cells": 0}
             if cap.number in table_match:
-                md_content = table_to_markdown(table_match[cap.number]["data"])
+                md_content, md_stats = table_to_markdown(table_match[cap.number]["data"])
+
+            # Decide whether the markdown is trustworthy. Heuristics:
+            #   - No content at all → PNG-only warning.
+            #   - More than 30% of cells are unresolved glyph IDs → warn.
+            #   - pdfplumber returned <= 2 rows for a table that's clearly bigger
+            #     (vertical extent < half of caption-bounded region) → warn.
+            usable = bool(md_content)
+            warn_reason = None
+            if not md_content:
+                warn_reason = "pdfplumber could not parse any rows"
+            elif md_stats["total_cells"] and md_stats["cid_cells"] / md_stats["total_cells"] > 0.30:
+                warn_reason = f"{md_stats['cid_cells']}/{md_stats['total_cells']} cells are undecodable PDF glyphs (likely ✓/✗ or special symbols); see PNG"
+            elif md_stats["rows"] <= 2 and (rect.y1 - rect.y0) > 100:
+                warn_reason = f"pdfplumber only resolved {md_stats['rows']} rows for a {int(rect.y1 - rect.y0)}pt-tall table; see PNG"
+
+            if warn_reason:
+                manifest["warnings"].append(f"Table {cap.number}: {warn_reason}")
+                preamble = f"> ⚠️ Markdown extraction is partial — {warn_reason}.\n> See `{png_path.name}` for the full table.\n\n"
+            else:
+                preamble = ""
+
             if not md_content:
                 md_content = f"<!-- pdfplumber could not parse Table {cap.number}; see {png_path.name} -->\n"
-                manifest["warnings"].append(f"Table {cap.number}: structure not parsed; PNG only")
+
             md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(f"# Table {cap.number}\n\n> {cap.text}\n\n{md_content}", encoding="utf-8")
+            md_path.write_text(
+                f"# Table {cap.number}\n\n> {cap.text}\n\n{preamble}{md_content}",
+                encoding="utf-8",
+            )
             manifest["tables"].append({
                 "number": cap.number,
                 "page": cap.page + 1,
                 "caption": cap.text,
                 "image": str(png_path.relative_to(out_dir)),
                 "markdown": str(md_path.relative_to(out_dir)),
+                "markdown_trustworthy": usable and not warn_reason,
             })
 
         elif cap.kind in ("algorithm", "listing"):
