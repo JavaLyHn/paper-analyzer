@@ -23,7 +23,7 @@ papers/<title>/
   ├── <title>.zh.md     完整中文版（领域术语保留英文）
   ├── <title>.en.md     完整英文版
   ├── figures/          按论文原序: figure-1.png, figure-2.png ...
-  ├── tables/           每张表两份: table-N.png + table-N.md
+  ├── tables/           按论文原序: table-1.png, table-2.png ...
   ├── code/             algorithm-N.md / listing-N.md（含代码块和图像备份）
   └── manifest.json     这次抽出来的所有资产清单
 ```
@@ -218,7 +218,7 @@ python <skill-dir>/scripts/extract_assets.py <pdf-path> <output-dir>
 - **主要指标**:
   - 用表格或要点列出。**必须给出具体数值**，不要写"显著优于"
   - 例：`方法 X: 84.3% 准确率, vs. baseline 81.7% (+2.6 pp)`
-- **数据表**：`![Table 2](./tables/table-2.png)` 或直接嵌入 `./tables/table-2.md` 内容
+- **数据表**：`![Table 2](./tables/table-2.png)`
 - **关键结果图**：`![Figure 9](./figures/figure-9.png)`
 - **重要消融**: 1-2 个最能说明问题的 ablation
 - **作者特别强调的发现**: 论文里 `we find that ...` 之后的话
@@ -243,7 +243,7 @@ python <skill-dir>/scripts/extract_assets.py <pdf-path> <output-dir>
 由 `extract_assets.py` 自动抽取（按论文原序）：
 
 - **Figures**: 共 N 张，见 `./figures/figure-1.png` ... `figure-N.png`
-- **Tables**: 共 M 张，见 `./tables/table-1.{png,md}` ... `table-M.{png,md}`
+- **Tables**: 共 M 张，见 `./tables/table-1.png` ... `table-M.png`
 - **Algorithms / Listings**: 见 `./code/`（如有）
 
 ---
@@ -312,7 +312,7 @@ python <skill-dir>/scripts/extract_assets.py <pdf-path> <output-dir>
 Automatically extracted by `extract_assets.py` (numbering follows the paper):
 
 - **Figures**: N total, in `./figures/`
-- **Tables**: M total, in `./tables/` (PNG + markdown each)
+- **Tables**: M total, in `./tables/`
 - **Algorithms / Listings**: in `./code/` (if any)
 
 ---
@@ -431,7 +431,7 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
      End-to-End-Encrypted-Git-Services.zh.md
      End-to-End-Encrypted-Git-Services.en.md
      figures/figure-1.png ... figure-10.png
-     tables/table-1.{png,md} ... table-3.{png,md}
+     tables/table-1.png ... table-3.png
      code/  (本篇无算法/列表，目录为空或不创建)
      manifest.json
    ```

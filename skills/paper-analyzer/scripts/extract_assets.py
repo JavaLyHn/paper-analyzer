@@ -7,7 +7,6 @@ Usage:
 Layout produced under <output-dir>:
     figures/figure-<n>.png
     tables/table-<n>.png
-    tables/table-<n>.md          (best-effort markdown via pdfplumber)
     code/algorithm-<n>.md        (text wrapped in ```)
     code/listing-<n>.md
     manifest.json                (list of everything extracted)
@@ -124,6 +123,41 @@ def _overlap_fraction_of(target: tuple, other: tuple) -> float:
     overlap = max(0.0, min(t_right, o_right) - max(t_left, o_left))
     target_w = max(1.0, t_right - t_left)
     return overlap / target_w
+
+
+def _detect_text_columns(all_blocks: list[tuple], page_w: float) -> list[tuple[float, float]]:
+    """Detect column ranges on a page by inspecting text block left-edges.
+
+    Returns a list of (col_left, col_right) tuples. If only one column is
+    detected (e.g. a single-column page or one with too few text blocks),
+    returns ``[(0, page_w)]``.
+
+    Why this exists: column-width detection via paragraph-block width fails
+    on pages where the only blocks are pseudocode or table cells — those
+    blocks aren't paragraph-like and the column-width fallback collapses to
+    `page_w * 0.9`, which then mis-classifies a 2-column page as single-col
+    and lets horizontal expansion swallow the neighbour column's content.
+    Left-edge clustering, in contrast, works whatever the blocks contain.
+    """
+    left_edges: list[float] = []
+    for bx0, _, _, _, btext, *_ in all_blocks:
+        s = (btext or "").strip()
+        if len(s) < 5:
+            continue
+        left_edges.append(bx0)
+    if len(left_edges) < 5:
+        return [(0.0, page_w)]
+    mid = page_w / 2
+    left_half = [x for x in left_edges if x < mid]
+    right_half = [x for x in left_edges if x >= mid]
+    if len(left_half) >= 3 and len(right_half) >= 3:
+        l_start = min(left_half)
+        r_start = min(right_half)
+        return [
+            (max(0.0, l_start - 4), r_start - 4),
+            (max(0.0, r_start - 4), page_w),
+        ]
+    return [(0.0, page_w)]
 
 
 def _is_paragraph_like(text: str) -> bool:
@@ -307,6 +341,103 @@ def asset_region(
             top = max(0, y0 - 4)
             bot = bot_candidate
 
+    # For figures (and algorithm/listing code blocks) the caption can be
+    # narrower than the asset itself — e.g. a centered "Figure N: …" caption
+    # under a wide protocol diagram, or a short "Algorithm N" caption above a
+    # full-column pseudocode block. After the vertical range is settled, sweep
+    # the page for non-prose content that sits inside that range and widen the
+    # horizontal extent. Two safety nets keep this from leaking sideways:
+    #   * **column limit** — the asset stays inside the column its caption
+    #     sits in, unless the caption itself is wider than the column (then
+    #     it's a full-width float and we allow the full page).
+    #   * **forbidden body strips** — if a drawing or label still extends
+    #     into a vertically-overlapping body-text column (e.g. a cloud-shaped
+    #     figure on page 3 that crosses into prose), clip back to the strip's
+    #     edge so the crop doesn't render partial letters of the prose.
+    if caption.kind in ("figure", "algorithm", "listing"):
+        columns = _detect_text_columns(all_blocks, page_w)
+        cap_center = (x0 + x1) / 2
+        cap_w_local = x1 - x0
+        caption_col: tuple[float, float] | None = None
+        for cl, cr in columns:
+            if cl <= cap_center <= cr:
+                caption_col = (cl, cr)
+                break
+        if caption_col is not None:
+            col_w = caption_col[1] - caption_col[0]
+            if cap_w_local > col_w * 0.9:
+                caption_col = (0.0, page_w)
+
+        forbidden_strips: list[tuple[float, float]] = []
+        for bx0, by0, bx1, by1_, btext, *_ in all_blocks:
+            stripped = (btext or "").strip()
+            if not stripped:
+                continue
+            if (
+                len(stripped) >= BODY_TEXT_MIN_CHARS
+                and (bx1 - bx0) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
+                and _is_paragraph_like(stripped)
+                and not _looks_like_caption(stripped)
+                and by1_ > top
+                and by0 < bot
+            ):
+                forbidden_strips.append((bx0, bx1))
+
+        for bx0, by0, bx1, by1_, btext, *_ in all_blocks:
+            stripped = (btext or "").strip()
+            if not stripped:
+                continue
+            bcy = (by0 + by1_) / 2
+            if not (top - 2 <= bcy <= bot + 2):
+                continue
+            if (
+                len(stripped) >= BODY_TEXT_MIN_CHARS
+                and (bx1 - bx0) >= column_width * BODY_TEXT_MIN_WIDTH_FRAC
+                and _is_paragraph_like(stripped)
+                and not _looks_like_caption(stripped)
+            ):
+                continue
+            left = min(left, bx0)
+            right = max(right, bx1)
+
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            drawings = []
+        for d in drawings:
+            r = d.get("rect") if isinstance(d, dict) else None
+            if r is None:
+                continue
+            dx0, dy0, dx1, dy1 = r.x0, r.y0, r.x1, r.y1
+            if dx1 - dx0 <= 0 or dy1 - dy0 <= 0:
+                continue
+            bcy = (dy0 + dy1) / 2
+            if not (top - 2 <= bcy <= bot + 2):
+                continue
+            left = min(left, dx0)
+            right = max(right, dx1)
+
+        if caption_col is not None:
+            left = max(left, caption_col[0])
+            right = min(right, caption_col[1])
+
+        left_clipped = False
+        right_clipped = False
+        for fx0, fx1 in forbidden_strips:
+            if fx0 <= left <= fx1:
+                left = fx1 + 4
+                left_clipped = True
+            if fx0 <= right <= fx1:
+                right = fx0 - 4
+                right_clipped = True
+        if not left_clipped:
+            left = max(0, left - 4)
+        if not right_clipped:
+            right = min(page_w, right + 4)
+        if right <= left:
+            left = max(0, x0 - 6)
+            right = min(page_w, x1 + 6)
+
     return fitz.Rect(left, top, right, bot)
 
 
@@ -342,56 +473,6 @@ def extract_tables_with_pdfplumber(pdf_path: Path) -> list[dict]:
                     "data": data,
                 })
     return results
-
-
-_CID_RE = re.compile(r"\(cid:\d+\)")
-
-
-def _clean_cell(cell: str | None) -> str:
-    """Normalize a single cell value: strip, collapse newlines, replace
-    unresolvable PDF glyph IDs (cid:NN) with a question mark so the markdown
-    is still readable.
-    """
-    if not cell:
-        return ""
-    cleaned = cell.strip().replace("\n", " ").replace("|", "\\|")
-    cleaned = _CID_RE.sub("?", cleaned).strip()
-    return cleaned
-
-
-def table_to_markdown(data: list[list[str | None]]) -> tuple[str, dict]:
-    """Best-effort 2D list -> markdown table.
-
-    Returns (markdown, stats). stats is {'rows', 'cols', 'cid_cells',
-    'total_cells'} so the caller can decide whether to warn that pdfplumber
-    failed to decode many cells.
-    """
-    stats = {"rows": 0, "cols": 0, "cid_cells": 0, "total_cells": 0}
-    if not data:
-        return "", stats
-
-    # Count cid-only cells BEFORE cleaning so we can report them
-    for row in data:
-        for cell in row:
-            stats["total_cells"] += 1
-            if cell and _CID_RE.search(cell):
-                stats["cid_cells"] += 1
-
-    norm = [[_clean_cell(c) for c in row] for row in data]
-    width = max(len(row) for row in norm)
-    norm = [row + [""] * (width - len(row)) for row in norm]
-    stats["rows"] = len(norm)
-    stats["cols"] = width
-
-    header = norm[0]
-    body = norm[1:] if len(norm) > 1 else []
-    lines = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join(["---"] * width) + " |",
-    ]
-    for row in body:
-        lines.append("| " + " | ".join(row) + " |")
-    return "\n".join(lines) + "\n", stats
 
 
 def extract_text_in_rect(page: fitz.Page, rect: fitz.Rect) -> str:
@@ -642,48 +723,12 @@ def main() -> int:
 
         elif cap.kind == "table":
             png_path = out_dir / "tables" / f"table-{cap.number}.png"
-            md_path = out_dir / "tables" / f"table-{cap.number}.md"
             render_region(page, rect, png_path)
-            md_content = ""
-            md_stats = {"rows": 0, "cols": 0, "cid_cells": 0, "total_cells": 0}
-            if cap.number in table_match:
-                md_content, md_stats = table_to_markdown(table_match[cap.number]["data"])
-
-            # Decide whether the markdown is trustworthy. Heuristics:
-            #   - No content at all → PNG-only warning.
-            #   - More than 30% of cells are unresolved glyph IDs → warn.
-            #   - pdfplumber returned <= 2 rows for a table that's clearly bigger
-            #     (vertical extent < half of caption-bounded region) → warn.
-            usable = bool(md_content)
-            warn_reason = None
-            if not md_content:
-                warn_reason = "pdfplumber could not parse any rows"
-            elif md_stats["total_cells"] and md_stats["cid_cells"] / md_stats["total_cells"] > 0.30:
-                warn_reason = f"{md_stats['cid_cells']}/{md_stats['total_cells']} cells are undecodable PDF glyphs (likely ✓/✗ or special symbols); see PNG"
-            elif md_stats["rows"] <= 2 and (rect.y1 - rect.y0) > 100:
-                warn_reason = f"pdfplumber only resolved {md_stats['rows']} rows for a {int(rect.y1 - rect.y0)}pt-tall table; see PNG"
-
-            if warn_reason:
-                manifest["warnings"].append(f"Table {cap.number}: {warn_reason}")
-                preamble = f"> ⚠️ Markdown extraction is partial — {warn_reason}.\n> See `{png_path.name}` for the full table.\n\n"
-            else:
-                preamble = ""
-
-            if not md_content:
-                md_content = f"<!-- pdfplumber could not parse Table {cap.number}; see {png_path.name} -->\n"
-
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(
-                f"# Table {cap.number}\n\n> {cap.text}\n\n{preamble}{md_content}",
-                encoding="utf-8",
-            )
             manifest["tables"].append({
                 "number": cap.number,
                 "page": cap.page + 1,
                 "caption": cap.text,
                 "image": str(png_path.relative_to(out_dir)),
-                "markdown": str(md_path.relative_to(out_dir)),
-                "markdown_trustworthy": usable and not warn_reason,
             })
 
         elif cap.kind in ("algorithm", "listing"):

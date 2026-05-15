@@ -11,7 +11,7 @@ papers/<title>/
   ├── <title>.zh.md     完整中文版（领域术语保留英文原文）
   ├── <title>.en.md     完整英文版
   ├── figures/          按论文原序: figure-1.png, figure-2.png ...
-  ├── tables/           每张表两份: table-N.png + table-N.md
+  ├── tables/           按论文原序: table-1.png, table-2.png ...
   ├── code/             algorithm-N.md / listing-N.md（含代码块和图像备份）
   └── manifest.json
 ```
@@ -97,7 +97,7 @@ python3 skills/paper-analyzer/scripts/extract_assets.py \
 ```
 output-dir/
 ├── figures/figure-1.png ...
-├── tables/table-1.png + table-1.md ...
+├── tables/table-1.png ...
 ├── code/algorithm-1.md + algorithm-1.png ...   # 如有
 └── manifest.json
 ```
