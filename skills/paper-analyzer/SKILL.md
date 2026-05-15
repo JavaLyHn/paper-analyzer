@@ -600,6 +600,99 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
 
 ---
 
+## Step 8 (按需): 生成 PPT 演示文稿
+
+当用户要求生成演示文稿时执行，默认**不主动**生成。
+
+**触发条件**：用户在读论文时说了 "做个PPT"、"生成幻灯片"、"make slides" 等，或读完后单独要求。
+
+### 流程
+
+**① 确认模板**
+
+- 用户提供了 `.pptx` 模板路径 → 记下，传给脚本（会套用母版配色/字体/背景，内容重新填）
+- 没有提供 → 使用脚本内置的默认学术主题（深蓝 header + 白底）
+
+**② 写 `<paper-dir>/slide-plan.json`**
+
+根据论文内容决定幻灯片结构，写入 JSON。**推荐结构（约 10-14 张）**：
+
+| 顺序 | 类型 | 内容建议 |
+|------|------|----------|
+| 1 | `title` | 论文标题、作者、会议/期刊、年份 |
+| 2 | `section` | "背景与问题 / Background" |
+| 3 | `bullets` | 问题陈述 3-4 条 + 可选右侧图 |
+| 4 | `bullets` | 相关工作差距（可选） |
+| 5 | `section` | "方法 / Method" |
+| 6 | `bullets` | 核心方法概览 + 架构图 |
+| 7 | `image` | 方法示意图 / 系统架构图（单独一张） |
+| 8 | `formula` | 核心公式 + 一句解释 |
+| 9 | `section` | "实验与结果 / Experiments" |
+| 10 | `bullets` | 实验设置 + 基线 |
+| 11 | `image` | 结果表/图（嵌入 table-N.png 或 figure-N.png） |
+| 12 | `bullets` | 创新点 + 局限性 |
+| 13 | `closing` | "Thank You / Q&A" |
+
+**JSON 格式**：
+
+```json
+{
+  "output_filename": "<sanitized-title>-slides",
+  "slides": [
+    {
+      "type": "title",
+      "title": "Full Paper Title",
+      "authors": "Author A, Author B",
+      "venue": "Conference/Journal 2025",
+      "year": "2025"
+    },
+    {
+      "type": "section",
+      "title": "Background & Problem"
+    },
+    {
+      "type": "bullets",
+      "title": "Problem Statement",
+      "bullets": ["Point 1 — concise (≤15 字)", "Point 2", "Prior work X fails because Y"],
+      "figure": "figures/figure-1.png"
+    },
+    {
+      "type": "image",
+      "title": "System Architecture",
+      "image": "figures/figure-2.png",
+      "caption": "Figure 2: System overview"
+    },
+    {
+      "type": "formula",
+      "title": "Core Formula",
+      "latex": "\\pi = \\text{Prove}(CRS, x, w)",
+      "caption": "Prover generates proof π given CRS, statement x, and witness w"
+    },
+    {
+      "type": "closing",
+      "title": "Thank You",
+      "subtitle": "Q & A"
+    }
+  ]
+}
+```
+
+**写 bullets 的原则**：每条不超过 15 个字（中）或 12 个英文单词；用动词开头；幻灯片 ≠ Word 文档。**只嵌入 manifest.json 里确认存在的图**，不存在的留 `"figure": null`。
+
+**③ 运行脚本**
+
+```bash
+# 无模板（内置学术主题）
+python3 <skill-dir>/scripts/generate_slides.py <paper-dir>
+
+# 使用用户模板
+python3 <skill-dir>/scripts/generate_slides.py <paper-dir> --template /path/to/template.pptx
+```
+
+**④ 告知用户**：保存路径、张数、是否套用了模板、公式是否渲染成功（需要 matplotlib）。
+
+---
+
 ## 输出前自检清单
 
 - [ ] **Step 2 已和用户确认领域 + 术语表**（不是自己猜的）
@@ -620,3 +713,4 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
 - [ ] **所有资产引用用相对路径 `./figures/...`，不要绝对路径**
 - [ ] 三份 `.md` 文件都已保存到 `<base>/<title>/` 目录下
 - [ ] 已告诉用户文件保存路径 + 抽到的 figures/tables 数量
+- [ ] **若用户要求 PPT**：slide-plan.json 已写入 paper-dir；脚本已跑；.pptx 路径已告诉用户

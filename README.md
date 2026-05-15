@@ -34,11 +34,17 @@ papers/<title>/
 - 按论文原序裁出来：Figure 3 一定是 `figure-3.png`
 - 单/双列、protocol box、带框图表都能处理；表格智能拓宽防右列截断
 
+**PPT 生成**靠 `scripts/generate_slides.py`（python-pptx 实现）：
+- 用户提供 `.pptx` 模板 → 套用母版配色/字体，内容重新填
+- 无模板 → 内置深蓝学术主题（16:9，约 10-14 张）
+- 支持 title / bullets / image / formula / section / closing 六种幻灯片类型
+- 公式通过 matplotlib 渲染为 PNG 嵌入
+
 ## 安装
 
 ```bash
-# 1. 装 Python 依赖（用于资产抽取）
-pip3 install --user PyMuPDF pdfplumber
+# 1. 装 Python 依赖（资产抽取 + PPT 生成）
+pip3 install --user PyMuPDF pdfplumber python-pptx matplotlib
 
 # 2. 安装 skill — 推荐用软链，仓库一更新就生效
 ln -s "$(pwd)/skills/paper-analyzer" ~/.claude/skills/paper-analyzer
