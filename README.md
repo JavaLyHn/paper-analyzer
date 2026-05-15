@@ -42,18 +42,119 @@ papers/<title>/
 
 ## 安装
 
-```bash
-# 1. 装 Python 依赖（资产抽取 + PPT 生成）
-pip3 install --user PyMuPDF pdfplumber python-pptx matplotlib
+### Step 1 — 装 Python 依赖（所有工具都要）
 
-# 2. 安装 skill — 推荐用软链，仓库一更新就生效
+```bash
+pip3 install --user PyMuPDF pdfplumber python-pptx matplotlib
+```
+
+### Step 2 — 克隆仓库
+
+```bash
+git clone https://github.com/JavaLyHn/paper-analyzer.git
+cd paper-analyzer
+```
+
+### Step 3 — 让你的 AI 工具接入这份 skill
+
+**核心思路**：让 AI 工具能读到 `skills/paper-analyzer/SKILL.md` 这份工作流，并能调用 `scripts/` 下的 Python 脚本。下面按工具分别说明。
+
+---
+
+#### 🟢 Claude Code（原生支持 Skills · 推荐）
+
+```bash
+# 软链 — 仓库 git pull 一更新就生效
 ln -s "$(pwd)/skills/paper-analyzer" ~/.claude/skills/paper-analyzer
 
-# 或一次性拷贝
+# 或者拷贝（不会跟随仓库更新）
 cp -R skills/paper-analyzer ~/.claude/skills/
 ```
 
-Claude Code 会在下次启动时自动发现这个 skill。
+重启 Claude Code → 直接说"帮我读这篇论文 `./xxx.pdf`"会自动触发。
+
+---
+
+#### 🟢 Codex CLI / Codex IDE（OpenAI）
+
+Codex CLI 不直接原生支持 Anthropic 风格的 SKILL.md，但可以通过**全局自定义指令**接入。
+
+```bash
+# 把工作流写入 Codex 的全局 instructions
+mkdir -p ~/.codex
+cat >> ~/.codex/AGENTS.md <<EOF
+
+## paper-analyzer skill
+当用户分享学术论文（PDF 路径 / arXiv URL / DOI / 标题）并要求"读 / 总结 / 翻译 / 精读"时，
+严格遵循 $(pwd)/skills/paper-analyzer/SKILL.md 里的完整工作流：
+- Step 2 必须先和用户对齐领域 + 术语表
+- 资产抽取调用 $(pwd)/skills/paper-analyzer/scripts/extract_assets.py
+- PPT 生成调用 $(pwd)/skills/paper-analyzer/scripts/generate_slides.py
+EOF
+```
+
+> 若你的 Codex 版本支持 `~/.agents/skills/` 标准目录（部分版本已支持 agent-skills 规范），也可以直接：
+> `ln -s "$(pwd)/skills/paper-analyzer" ~/.agents/skills/paper-analyzer`
+
+---
+
+#### 🟡 Cursor（通过 Rules 适配）
+
+Cursor 没有 skill 系统，用 `.cursor/rules/*.mdc` 注入工作流：
+
+**全局**（所有项目都用）：
+
+```bash
+mkdir -p ~/.cursor/rules
+cat > ~/.cursor/rules/paper-analyzer.mdc <<EOF
+---
+description: 当用户分享学术论文 PDF / arXiv URL / DOI / 论文标题时触发
+alwaysApply: false
+---
+
+阅读并严格遵循 @$(pwd)/skills/paper-analyzer/SKILL.md 里的完整工作流。
+资产抽取脚本：$(pwd)/skills/paper-analyzer/scripts/extract_assets.py
+PPT 生成脚本：$(pwd)/skills/paper-analyzer/scripts/generate_slides.py
+EOF
+```
+
+**项目级**：把上面的 `.mdc` 放到 `<your-project>/.cursor/rules/paper-analyzer.mdc`。
+
+---
+
+#### 🟡 Trae（通过 Rules 适配）
+
+Trae 也是 rules-based 工具。在 Trae 的**用户规则**或**项目规则**里粘贴：
+
+```
+当用户分享学术论文（PDF / arXiv / DOI / 论文标题）并要求阅读/总结/翻译时，请严格遵循以下工作流文件：
+
+<仓库路径>/skills/paper-analyzer/SKILL.md
+
+可用的脚本：
+- <仓库路径>/skills/paper-analyzer/scripts/extract_assets.py  (PDF → figures/tables/code)
+- <仓库路径>/skills/paper-analyzer/scripts/generate_slides.py (生成 .pptx)
+
+注意：开始翻译前必须先和用户确认领域 + 要保留英文的术语清单。
+```
+
+把 `<仓库路径>` 换成你 clone 的实际绝对路径。
+
+---
+
+#### 🟡 Windsurf / Cline / Continue / 其他
+
+通用做法：把这段加进该工具的"系统提示词"或"自定义指令"：
+
+```
+当用户分享学术论文时，参考 <仓库路径>/skills/paper-analyzer/SKILL.md 的工作流：
+1. 抽取资产用 scripts/extract_assets.py
+2. 翻译前必须先和用户对齐领域 + 术语表
+3. 产出 .zh-full.md（完整翻译）+ .zh.md / .en.md（结构化总结）
+4. 用户要 PPT 时调用 scripts/generate_slides.py
+```
+
+> 这些工具没有原生 skill 系统，主要靠 prompt 注入。效果取决于工具的 instruction-following 能力。Claude Code / Codex 是最稳的两种。
 
 ## 使用
 
