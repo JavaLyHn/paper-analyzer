@@ -1,6 +1,6 @@
 # paper-analyzer
 
-一个用于精读学术论文、产出**双语结构化研究笔记 + 自动抽取图表代码**的 Claude Skill。
+一个用于精读学术论文、产出**完整中文翻译 + 双语结构化研究笔记 + 自动抽取图表代码**的 Claude Skill。
 
 ## 这个 skill 做什么
 
@@ -8,15 +8,22 @@
 
 ```
 papers/<title>/
-  ├── <title>.zh.md     完整中文版（领域术语保留英文原文）
-  ├── <title>.en.md     完整英文版
-  ├── figures/          按论文原序: figure-1.png, figure-2.png ...
-  ├── tables/           按论文原序: table-1.png, table-2.png ...
-  ├── code/             algorithm-N.md / listing-N.md（含代码块和图像备份）
+  ├── <title>.zh-full.md  逐段完整中文翻译（领域术语保留英文，图表按引用位置嵌入）
+  ├── <title>.zh.md       中文结构化总结（4 段骨架）
+  ├── <title>.en.md       英文结构化总结
+  ├── figures/            按论文原序: figure-1.png, figure-2.png ...
+  ├── tables/             按论文原序: table-1.png, table-2.png ...
+  ├── code/               algorithm-N.md / listing-N.md（含代码块和图像备份）
   └── manifest.json
 ```
 
-**两份笔记**都按固定 4 段组织：
+**翻译版 (`.zh-full.md`)** —— 给做深度阅读用：
+- 章节、段落和原文一一对应，不合并不省略
+- 领域专业术语保留英文（开始翻译前会先和用户对齐**领域 + 术语表**）
+- 公式、引用文献、作者名保留原样
+- 图表按正文第一次引用的位置嵌入
+
+**结构化总结 (`.zh.md` / `.en.md`)** —— 给后续 scan / 复用 / 引用：
 1. 元信息 & TL;DR
 2. 背景/问题 & 方法
 3. 实验与结果（带具体数字）
@@ -25,7 +32,7 @@ papers/<title>/
 **资产抽取**靠 `scripts/extract_assets.py`（PyMuPDF + pdfplumber 实现）：
 - 自动找论文里所有 `Figure N` / `Table N` / `Algorithm N` / `Listing N` caption
 - 按论文原序裁出来：Figure 3 一定是 `figure-3.png`
-- 单/双列布局都处理；表格智能拓宽 bbox 防右列截断
+- 单/双列、protocol box、带框图表都能处理；表格智能拓宽防右列截断
 
 ## 安装
 
@@ -54,7 +61,7 @@ Claude Code 会在下次启动时自动发现这个 skill。
 https://arxiv.org/abs/1706.03762  精读一下
 ```
 
-Claude 会自动触发 `paper-analyzer`，识别论文领域，产出中英两份 `.md` 文件，默认保存到 `./papers/`。
+Claude 会自动触发 `paper-analyzer`，**先和你对齐论文领域 + 要保留英文的术语清单**，然后产出三份 `.md`（完整翻译 + 中英结构化总结）加图表资产，默认保存到 `./papers/`。
 
 ## 配置
 
@@ -92,7 +99,7 @@ python3 skills/paper-analyzer/scripts/extract_assets.py \
     /path/to/output-dir/
 ```
 
-输出：
+输出（只含资产，不含 markdown 笔记 —— 那部分由 Claude skill 流程生成）：
 
 ```
 output-dir/
