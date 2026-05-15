@@ -1,11 +1,11 @@
 ---
 name: paper-analyzer
-description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title) and produce TWO complete structured research summaries — one full Chinese version (with field-appropriate English terminology preserved) and one full English version. Covers metadata, motivation, method, experiments, contributions and limitations. Use this skill whenever the user shares a paper, an arXiv URL, a DOI, a paper title, or pastes a chunk of academic text and asks to "read / summarize / analyze / 解读 / 总结 / 精读" it — even if the user does not explicitly say "use paper-analyzer". Also trigger when the user wants to compare or do a literature review starting from a single paper.
+description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title) and produce a complete paper-study package — full Chinese summary, full English summary, plus extracted figures / tables / algorithms / listings saved into per-paper subfolders following the paper's own numbering (Figure 1, Table 1, Algorithm 1, etc.). Covers metadata, motivation, method, experiments, contributions and limitations, with field-appropriate English terminology preserved in the Chinese version. Use this skill whenever the user shares a paper, an arXiv URL, a DOI, a paper title, or pastes a chunk of academic text and asks to "read / summarize / analyze / 解读 / 总结 / 精读" it — even if the user does not explicitly say "use paper-analyzer". Also trigger when the user wants to compare or do a literature review starting from a single paper.
 ---
 
 # Paper Analyzer
 
-把一篇学术论文变成两份**结构化、可归档**的研究笔记：完整中文版 + 完整英文版。中文版里**该保留的英文术语保留**，不强行翻译。
+把一篇学术论文变成一份**结构化、可归档、自带原文图表**的研究笔记包：完整中文版 + 完整英文版 + 按原文顺序抽出的 figures / tables / code 子文件夹。中文版里**该保留的英文术语保留**，不强行翻译。
 
 ## 为什么需要这个 skill
 
@@ -14,8 +14,21 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - 全中文翻译会丢掉作者的术语命名，下次想搜索/引用时反而找不到（"变压器架构"显然不如 "Transformer architecture" 好用）
 - 全英文摘要不够亲切，做中文写作或讲给同事听都得二次翻译
 - 用一段散文当总结，下次想引用某个数字还得翻原文
+- 关键图表只在 PDF 里 —— 想插进 Notion/Obsidian/写作里都要手动截图
 
-这个 skill 的设计是：**两份独立的笔记**，中文一份英文一份，都按固定 4 段结构产出。中文版根据论文所在的**学术领域**，保留该领域里大家公认不翻译的英文术语。
+这个 skill 的设计是：**一份完整的论文笔记包**
+
+```
+papers/<title>/
+  ├── <title>.zh.md     完整中文版（领域术语保留英文）
+  ├── <title>.en.md     完整英文版
+  ├── figures/          按论文原序: figure-1.png, figure-2.png ...
+  ├── tables/           每张表两份: table-N.png + table-N.md
+  ├── code/             algorithm-N.md / listing-N.md（含代码块和图像备份）
+  └── manifest.json     这次抽出来的所有资产清单
+```
+
+中英两份都按固定 4 段结构产出。中文版根据论文所在的**学术领域**，保留该领域里大家公认不翻译的英文术语。资产编号严格跟随论文原文（Figure 1 就是 `figure-1.png`）。
 
 ---
 
@@ -41,19 +54,23 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 用户输入
     │
     ▼
-[Step 1] 拿到论文文本（PDF/URL/粘贴/DOI 四种来源）
+[Step 1] 拿到论文文本（PDF / URL / 粘贴 / DOI 四种来源）
     │
     ▼
-[Step 2] 识别论文领域和关键术语（重要！决定中文版怎么处理术语）
+[Step 2] 识别论文领域和关键术语（决定中文版怎么处理术语）
     │
     ▼
-[Step 3] 产出中文版（preserving field-specific English terms）
+[Step 3] 抽取资产 → figures/ tables/ code/（仅当输入是 PDF 时可用）
     │
     ▼
-[Step 4] 产出英文版
+[Step 4] 产出中文版（preserving field-specific English terms）
+    │       └── 引用抽出的 figures/tables/algorithms 时插入相对路径
     │
     ▼
-[Step 5] 保存两份文件到用户配置的路径 + 在聊天里展示中文版
+[Step 5] 产出英文版
+    │
+    ▼
+[Step 6] 把整个 papers/<title>/ 包保存到用户配置的路径 + 聊天里展示中文版
 ```
 
 ---
@@ -114,11 +131,56 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 
 ---
 
-## Step 3-4: 产出中英两份完整总结
+## Step 3: 抽取论文资产（仅 PDF 输入）
+
+如果输入是 PDF（本地文件或下载好的 arXiv PDF），**先跑一次资产抽取脚本**，让后续的 markdown 总结可以直接引用提取出的图表，而不是要求用户回去翻 PDF。
+
+### 调用方式
+
+```bash
+python <skill-dir>/scripts/extract_assets.py <pdf-path> <output-dir>
+```
+
+- `<output-dir>` 是 `papers/<sanitized-title>/`，脚本会在里面建 `figures/`、`tables/`、`code/`
+- 脚本会扫描 PDF 里所有 `Figure N` / `Table N` / `Algorithm N` / `Listing N` 标题
+- 输出按论文**原序**编号：Figure 3 一定保存为 `figure-3.png`
+- 表格同时产出 PNG（一定能用）和 markdown（pdfplumber 解析，复杂表头可能丢真度）
+- 算法 / 列表同时产出 markdown 代码块和 PNG 备份
+- 完成后写一份 `manifest.json` 总结
+
+### 解析 manifest
+
+跑完之后先读 `<output-dir>/manifest.json`，了解：
+
+- 提取到了哪些资产
+- 哪些表 pdfplumber 没能解析（manifest 的 `warnings` 字段会标出）
+- 资产对应的页码（方便在总结里引用 "见 Figure 3 (p.8)"）
+
+### 何时跳过这一步
+
+- **粘贴文本**：没有 PDF，跳过抽取，在总结开头加一行 `> 注：未提供 PDF，本笔记不含图表附件`
+- **仅基于摘要**：同上
+- **arXiv URL**：先下载 PDF（`wget <abs-url:s/abs/pdf/>` 或 `curl -L -o`），再跑抽取
+- **DOI / 标题**：先用 WebSearch 拿到可用 PDF；拿不到就跳过
+
+### 失败时怎么办
+
+- 脚本依赖 `PyMuPDF` 和 `pdfplumber`。如果 `python3 -c "import fitz"` 失败：
+  ```bash
+  pip3 install --user PyMuPDF pdfplumber
+  ```
+  装完重试。如果用户机器装不上（罕见），**告诉用户而不是静默跳过**：说"我没法装 PyMuPDF，这次只产出 markdown 笔记，图表请手动从 PDF 截图保存到 figures/ 子目录"。
+- PDF 是扫描件 → caption 找不到 → manifest 里几乎全空。这种情况主动跟用户说："这份 PDF 是扫描版，文本层和 caption 都抽不到，需要先 OCR 后再处理；或者你直接告诉我这篇论文有哪些关键图，我在总结里留好引用占位"
+
+---
+
+## Step 4-5: 产出中英两份完整总结
 
 两份**都用下面的 4 段固定结构**，顺序不要变。
 
 ### 中文版模板（保留领域术语英文原文）
+
+模板里的 `![]()` 用相对路径引用抽出的资产。**只在论文里真有这张图/表/算法时才插入引用**（看 manifest 验证），不要凭空写 "见 figure-5.png" 然后路径不存在。
 
 ```markdown
 # <论文中文译名> / <Original English Title>
@@ -145,6 +207,8 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - 方法名（保留原文）
 - 关键步骤 / 架构组件（分点）
 - 关键公式或伪代码（**用 LaTeX 或代码块完整抄录**，不要意译）
+- 系统/架构图：`![Figure 1](./figures/figure-1.png)` *若有相关图*
+- 算法：引用 `./code/algorithm-N.md`
 - 与已有方法的区别（vs. baseline X / vs. prior work Y）
 
 ## 3. 实验与结果
@@ -154,6 +218,8 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - **主要指标**:
   - 用表格或要点列出。**必须给出具体数值**，不要写"显著优于"
   - 例：`方法 X: 84.3% 准确率, vs. baseline 81.7% (+2.6 pp)`
+- **数据表**：`![Table 2](./tables/table-2.png)` 或直接嵌入 `./tables/table-2.md` 内容
+- **关键结果图**：`![Figure 9](./figures/figure-9.png)`
 - **重要消融**: 1-2 个最能说明问题的 ablation
 - **作者特别强调的发现**: 论文里 `we find that ...` 之后的话
 
@@ -169,6 +235,16 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 ### 4.3 后续 / Future directions
 - 论文里提到的 future work
 - 你的研究 idea / 可追的引用 / 可复现性（代码/数据是否公开）
+
+---
+
+## 附录 / Assets index
+
+由 `extract_assets.py` 自动抽取（按论文原序）：
+
+- **Figures**: 共 N 张，见 `./figures/figure-1.png` ... `figure-N.png`
+- **Tables**: 共 M 张，见 `./tables/table-1.{png,md}` ... `table-M.{png,md}`
+- **Algorithms / Listings**: 见 `./code/`（如有）
 
 ---
 *Generated by paper-analyzer skill · 中文版*
@@ -201,6 +277,8 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - Method name
 - Key steps / architectural components
 - Key formulas or pseudocode (**transcribed verbatim**)
+- Architecture diagram: `![Figure 1](./figures/figure-1.png)`
+- Algorithm: see `./code/algorithm-N.md`
 - Differences vs. prior work
 
 ## 3. Experiments & Results
@@ -209,6 +287,8 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - **Baselines**: ...
 - **Key metrics**:
   - With **specific numbers**, not "significantly better"
+- **Result tables**: `![Table 2](./tables/table-2.png)`
+- **Result plots**: `![Figure 9](./figures/figure-9.png)`
 - **Ablations**: 1-2 informative ones
 - **Author-highlighted findings**
 
@@ -226,26 +306,48 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - Your own research ideas / follow-up citations / reproducibility notes
 
 ---
+
+## Assets index
+
+Automatically extracted by `extract_assets.py` (numbering follows the paper):
+
+- **Figures**: N total, in `./figures/`
+- **Tables**: M total, in `./tables/` (PNG + markdown each)
+- **Algorithms / Listings**: in `./code/` (if any)
+
+---
 *Generated by paper-analyzer skill · English version*
 ```
 
 ---
 
-## Step 5: 保存文件
+## Step 6: 保存整个笔记包
 
-### 默认保存路径
+### 输出结构（重要）
 
-- 中文版：`<base>/<sanitized-title>.zh.md`
-- 英文版：`<base>/<sanitized-title>.en.md`
-- 默认 `<base>` = `./papers/`（当前工作目录下）
+每篇论文有自己独立的子目录，所有相关内容都在一起：
 
-### 路径可由用户配置
+```
+<base>/<sanitized-title>/
+  ├── <sanitized-title>.zh.md
+  ├── <sanitized-title>.en.md
+  ├── figures/
+  ├── tables/
+  ├── code/
+  └── manifest.json
+```
 
-按优先级查找：
+注意：**所有路径都是这个论文文件夹内部的相对路径**，markdown 里引用 `./figures/figure-1.png` 而不是 `../figures/...`。这样把整个文件夹拷贝到 Obsidian / Notion / 其他地方也不会失效。
+
+### 默认 base 路径
+
+`<base>` = `./papers/`（当前工作目录下）
+
+### 路径可由用户配置（按优先级查找）
 
 1. **本次会话用户明说的路径**（如"存到 ~/Obsidian/Papers"）→ 直接用
-2. **配置文件 `./paper-analyzer.config.json` 里的 `outputDir` 字段** → 用
-3. **用户主目录 `~/.paper-analyzer/config.json` 里的 `outputDir`** → 用
+2. **`./paper-analyzer.config.json` 里的 `outputDir`** → 用
+3. **`~/.paper-analyzer/config.json` 里的 `outputDir`** → 用
 4. **都没有** → 用默认 `./papers/`，**第一次保存时主动问一句**："默认保存到 `./papers/`，要改路径吗？如果想以后都用某个目录，告诉我我帮你写到 `~/.paper-analyzer/config.json`"
 
 配置文件示例：
@@ -255,15 +357,15 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 }
 ```
 
-### 文件名规则
+### 文件夹/文件名规则
 - 取**英文标题**，去除特殊字符（`/\:*?"<>|`），空格换成 `-`，长度限 80 字符
 - 如果只有中文标题，用中文标题 + arxiv id（如有）
-- 重名加 `-2`、`-3` 后缀，**绝不覆盖**
+- 文件夹重名：先 diff 已有的 `.zh.md`，如果是同一篇论文（标题/作者/年份吻合）→ 加 `-v2`、`-v3` 子目录；如果根本是另一篇 → 加序号后缀。**永远不覆盖**用户已有笔记。
 
 ### 聊天里展示
-- 默认在聊天里**完整打印中文版**
-- 末尾提示："中文版已保存到 `<path>.zh.md`，英文版已保存到 `<path>.en.md`"
-- 如果用户明说想看英文，就打印英文版
+- 默认在聊天里**完整打印中文版**（包括图表的 markdown 引用，渲染器会显示出来）
+- 末尾提示："整个笔记包已保存到 `<base>/<title>/`，含 N 张 figures、M 张 tables"
+- 如果用户明说想看英文，再打印英文版
 
 ---
 
@@ -296,9 +398,13 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 | 中文意译方法名（Transformer→变压器，TEE→可信执行环境后不给原文） | 后续搜索/引用全要英文原文 |
 | 仅靠摘要却不声明，输出看起来像精读全文 | 严重误导用户 |
 | 把作者的局限和自己的吐槽混在一起 | 引用时分不清出处 |
-| 直接覆盖已有的 papers/xxx.md | 用户之前的笔记 + 自己批注就丢了 |
+| 直接覆盖已有的 papers/xxx/ 目录 | 用户之前的笔记 + 自己批注就丢了 |
 | 只产出中文版没产出英文版（或反之） | 设计就是两份并存 |
 | 中英两版结构不一致 | 失去对照价值 |
+| 在 markdown 里写 `![](./figures/figure-7.png)` 但 figure-7.png 不存在 | 检查 manifest，论文没有就别假装有 |
+| 跳过资产抽取，让用户自己手动从 PDF 截图 | skill 就废了一半价值 |
+| 给 PDF 输入却没跑 extract_assets.py | 等于丢掉图表那半儿 |
+| 用相对路径 `../figures/...`、绝对路径或 `~/...` 引用资产 | 笔记包不可移植 |
 
 ---
 
@@ -308,14 +414,28 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 > 帮我读一下 `./End-to-End Encrypted Git Services.pdf`
 
 **应有的处理**：
-1. 用 PDF 抽取工具读全文
-2. 识别领域：密码学 + 系统安全（标题里有 Encrypted、Git，正文出现 commit、Merkle tree、authenticated encryption 等）
-3. 应用密码学术语保留规则：`E2EE`、`commit`、`Merkle tree`、`authenticated encryption`、`server-side push`、`zero-knowledge` 等保留英文
-4. 产出中文版和英文版两份
-5. 默认保存为：
-   - `./papers/End-to-End-Encrypted-Git-Services.zh.md`
-   - `./papers/End-to-End-Encrypted-Git-Services.en.md`
-6. 聊天里打印中文版完整内容 + 末尾告诉用户文件保存位置
+1. 用 PDF 抽取工具读全文（pdfplumber 或 PyMuPDF）
+2. 识别领域：密码学 + 系统安全（标题里有 Encrypted、Git，正文出现 commit、Merkle tree、authenticated encryption、CCS '25 等）
+3. **跑 `python scripts/extract_assets.py ./End-to-End\ Encrypted\ Git\ Services.pdf ./papers/End-to-End-Encrypted-Git-Services/`**
+   - 这篇会抽出大约 10 张 figures + 3 张 tables（实测）
+   - 读 `manifest.json` 看到每张资产对应的 caption 和页码
+4. 应用密码学术语保留规则：`E2EE`、`commit`、`Merkle tree`、`authenticated encryption`、`SGitLine` / `SGitChar`（这是论文里的方案命名，必须保留）、`zero-knowledge` 等保留英文
+5. 产出中文版和英文版两份，markdown 里嵌入：
+   - `![Figure 1: 架构](./figures/figure-1.png)` 在"背景"一节展示系统架构
+   - `![Figure 6: 构造](./figures/figure-6.png)` 在"核心方法"展示 SGit 的构造
+   - `![Table 2](./tables/table-2.png)` 在"实验结果"展示通信成本
+   - `![Figure 9](./figures/figure-9.png)` 展示存储成本对比
+6. 默认保存为：
+   ```
+   ./papers/End-to-End-Encrypted-Git-Services/
+     End-to-End-Encrypted-Git-Services.zh.md
+     End-to-End-Encrypted-Git-Services.en.md
+     figures/figure-1.png ... figure-10.png
+     tables/table-1.{png,md} ... table-3.{png,md}
+     code/  (本篇无算法/列表，目录为空或不创建)
+     manifest.json
+   ```
+7. 聊天里打印中文版完整内容 + 末尾告诉用户文件保存位置和抽到的资产数量
 
 ---
 
@@ -329,5 +449,8 @@ description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title)
 - [ ] 英文版整篇英文，不夹杂中文
 - [ ] 如果只基于摘要，已在 TL;DR 处加 `⚠️` 声明
 - [ ] 作者 contribution 和 reviewer note 分开了
-- [ ] 两份 `.md` 文件都已保存且文件名规范
-- [ ] 已告诉用户文件保存路径
+- [ ] **若输入是 PDF：跑过 `extract_assets.py` 且 manifest 已存在**
+- [ ] **markdown 里引用的 `figure-N.png` / `table-N.png` 都在 manifest 里能查到**
+- [ ] **所有资产引用用相对路径 `./figures/...`，不要绝对路径**
+- [ ] 两份 `.md` 文件都已保存到 `<base>/<title>/` 目录下
+- [ ] 已告诉用户文件保存路径 + 抽到的 figures/tables 数量
