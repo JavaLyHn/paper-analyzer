@@ -1,0 +1,25 @@
+{
+  "skill_name": "paper-analyzer",
+  "evals": [
+    {
+      "id": 1,
+      "name": "local-pdf-cryptography",
+      "prompt": "帮我读一下 ./End-to-End Encrypted Git Services.pdf 这篇论文",
+      "expected_output": "正确识别为密码学/系统安全领域；产出完整中文版 + 完整英文版两个文件；中文版保留 commit、Merkle tree、E2EE、authenticated encryption 等密码学术语英文原文；元信息(作者/机构/会议/年份)准确；TL;DR 一句话说清楚论文做了什么；4 大节齐全；包含原文里的具体性能/安全性数字而不是'显著优于'；末尾告诉用户两份文件保存路径",
+      "files": ["End-to-End Encrypted Git Services.pdf"]
+    },
+    {
+      "id": 2,
+      "name": "arxiv-url-ml",
+      "prompt": "https://arxiv.org/abs/1706.03762 帮我精读一下",
+      "expected_output": "正确从 arXiv 抽取论文(Attention Is All You Need)；识别为 ML/NLP 领域；中文版保留 Transformer、attention、multi-head attention、BLEU 等术语英文原文；中文版和英文版结构一致；包含具体 BLEU 分数(28.4 EN-DE, 41.8 EN-FR)而非泛泛'高出 baseline'；区分作者声称的 contribution 和 reviewer 的局限观察",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "abstract-only-with-warning",
+      "prompt": "这篇论文不太好下，我只能给你摘要，你帮我先做个总结：\n\nAbstract: We present a novel zero-knowledge proof system for verifiable computation on encrypted data. Our scheme achieves 3.2x faster proving time than existing zk-SNARK approaches while maintaining O(log n) proof size. We evaluate on three benchmarks (MNIST, CIFAR-10, ImageNet) and demonstrate practical deployment with sub-second verification.",
+      "expected_output": "识别为密码学领域；中文版保留 zero-knowledge proof / zk-SNARK / proving time / proof size 等术语；**必须在 TL;DR 处明确加 ⚠️ 声明仅基于摘要**；元信息中作者/会议/年份等无法从摘要确定的字段标 unknown 不要瞎编；不能假装看完了全文，方法部分应只复述摘要中提到的；具体数字 3.2x、O(log n)、sub-second 都要保留；产出中英两版"
+    }
+  ]
+}

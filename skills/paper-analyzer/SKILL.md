@@ -1,0 +1,333 @@
+---
+name: paper-analyzer
+description: Read an academic paper (PDF, arXiv link, pasted text, or DOI/title) and produce TWO complete structured research summaries — one full Chinese version (with field-appropriate English terminology preserved) and one full English version. Covers metadata, motivation, method, experiments, contributions and limitations. Use this skill whenever the user shares a paper, an arXiv URL, a DOI, a paper title, or pastes a chunk of academic text and asks to "read / summarize / analyze / 解读 / 总结 / 精读" it — even if the user does not explicitly say "use paper-analyzer". Also trigger when the user wants to compare or do a literature review starting from a single paper.
+---
+
+# Paper Analyzer
+
+把一篇学术论文变成两份**结构化、可归档**的研究笔记：完整中文版 + 完整英文版。中文版里**该保留的英文术语保留**，不强行翻译。
+
+## 为什么需要这个 skill
+
+读论文最贵的不是看，而是**看完之后能不能复用**。问题在于：
+
+- 全中文翻译会丢掉作者的术语命名，下次想搜索/引用时反而找不到（"变压器架构"显然不如 "Transformer architecture" 好用）
+- 全英文摘要不够亲切，做中文写作或讲给同事听都得二次翻译
+- 用一段散文当总结，下次想引用某个数字还得翻原文
+
+这个 skill 的设计是：**两份独立的笔记**，中文一份英文一份，都按固定 4 段结构产出。中文版根据论文所在的**学术领域**，保留该领域里大家公认不翻译的英文术语。
+
+---
+
+## 何时使用
+
+触发场景（用户不一定明说，应当主动使用）：
+
+- 用户发了 PDF 文件路径、arXiv 链接（`arxiv.org/abs/...`、`arxiv.org/pdf/...`）、DOI、论文标题
+- 用户粘贴了一大段明显是论文摘要/正文的英文文字
+- 用户说 "帮我读一下"、"精读"、"总结这篇"、"summarize this paper"、"give me a TL;DR"、"analyze this"
+- 用户在做综述、从一篇论文切入
+
+**不要使用** 的场景：
+
+- 用户只是问"XX 论文讲了啥"这种**没有附材料**的常识性问题——这是检索任务
+- 用户发的是非学术内容（博客、新闻稿、说明书）
+
+---
+
+## 整体流程
+
+```
+用户输入
+    │
+    ▼
+[Step 1] 拿到论文文本（PDF/URL/粘贴/DOI 四种来源）
+    │
+    ▼
+[Step 2] 识别论文领域和关键术语（重要！决定中文版怎么处理术语）
+    │
+    ▼
+[Step 3] 产出中文版（preserving field-specific English terms）
+    │
+    ▼
+[Step 4] 产出英文版
+    │
+    ▼
+[Step 5] 保存两份文件到用户配置的路径 + 在聊天里展示中文版
+```
+
+---
+
+## Step 1: 拿到论文文本
+
+| 输入类型 | 处理方式 |
+|---------|---------|
+| 本地 PDF | 用 PDF 抽取工具（pdfplumber / pdftotext / pypdf）拿到完整文本。如果是扫描件 OCR 不出，**明确告诉用户**而不是猜 |
+| arXiv URL | 把 `abs` 改成 `pdf` 下载，或调 arXiv API 拿标题/作者/分类作为元信息 |
+| 粘贴文本 | 直接用，但在元信息里提示**正文可能不完整**，元信息按用户给的为准 |
+| DOI / 论文标题 | 先用 WebSearch 确认标题、作者、年份；能拿到 PDF/arXiv 就抽全文；只能拿到摘要时**明确声明"仅基于摘要"**，不要假装看完了全文 |
+
+**重要**：如果用户给的来源你没把握抽到全文（如 IEEE/Springer 收费墙），**先告诉用户你目前能拿到什么**，让用户决定是基于摘要继续，还是发 PDF 过来。不要静默地拿摘要冒充全文总结。
+
+---
+
+## Step 2: 识别论文领域 ← 关键
+
+在产出总结前，**先判断这篇论文属于什么领域**，因为不同领域的术语保留惯例完全不同。
+
+### 识别方法
+- 看 arXiv 分类（`cs.CR` 是密码学/安全，`cs.LG` 是机器学习，`cs.DB` 是数据库……）
+- 看摘要里反复出现的核心名词
+- 看引用集中的会议（CRYPTO/USENIX Security → 安全密码；NeurIPS/ICML → ML；SIGMOD/VLDB → 数据库）
+
+### 各领域的术语保留惯例
+
+下面是**中文版**里**应当保留英文原文**的术语类别（按领域）。这是给你的参照，遇到具体术语就按这个尺度判断；如果某个术语在中文学术圈已有非常通用的中译（如 "神经网络""服务器""数据库"），那就翻译。
+
+**密码学 / 系统安全 (cryptography, security)**：
+- 协议名/算法名：`AES`、`RSA`、`ECDSA`、`SHA-256`、`HMAC`、`Diffie-Hellman`、`zero-knowledge proof`、`commitment scheme`、`Merkle tree`
+- 安全属性：`IND-CPA`、`IND-CCA`、`forward secrecy`、`post-quantum`
+- 系统组件：`oblivious RAM`、`trusted execution environment (TEE)`、`SGX`、`zk-SNARK`
+- 攻击/威胁模型：`malicious adversary`、`honest-but-curious`、`side-channel`
+- 协议步骤：`commit`、`reveal`、`verify`、`challenge`、`response`
+
+**机器学习 / 深度学习 (ML, DL, NLP, CV)**：
+- 架构名：`Transformer`、`CNN`、`RNN`、`LSTM`、`GAN`、`VAE`、`Diffusion model`
+- 训练机制：`attention`、`backpropagation`、`gradient descent`、`fine-tuning`、`RLHF`、`SFT`
+- 数据/任务：`ImageNet`、`GLUE`、`SQuAD`、`few-shot`、`zero-shot`、`in-context learning`
+- 指标：`accuracy`、`F1`、`BLEU`、`perplexity`、`AUC`
+
+**系统 / 数据库 / 分布式 (systems, DB, distributed)**：
+- 一致性模型：`linearizability`、`serializability`、`eventual consistency`、`CAP theorem`
+- 协议：`Paxos`、`Raft`、`2PC`、`MVCC`
+- 系统名：`Kubernetes`、`Spanner`、`HDFS`
+
+**理论计算机科学 (theory, algorithms)**：
+- 复杂度类：`P`、`NP`、`PSPACE`、`#P`、`BPP`
+- 范式：`approximation algorithm`、`online algorithm`、`streaming algorithm`
+
+**其他领域**：如果你不确定该领域的惯例，**问用户**："这篇论文偏密码学还是系统安全？密码学惯例是保留协议名，系统更倾向保留组件名，您希望按哪种处理？"
+
+### 处理新领域
+
+当遇到本节没列的领域（如生物信息、计算金融），**临时识别 5-10 个核心术语**作为该篇论文的"保留词表"，在中文版里统一处理。如果用户经常读这个领域，下次提醒用户把这些术语加进 `references/terminology-by-field.md`（如果存在），让 skill 越用越准。
+
+---
+
+## Step 3-4: 产出中英两份完整总结
+
+两份**都用下面的 4 段固定结构**，顺序不要变。
+
+### 中文版模板（保留领域术语英文原文）
+
+```markdown
+# <论文中文译名> / <Original English Title>
+
+> 📝 中文版 · 关键术语保留 [领域名] 学术惯例
+
+## 1. 元信息 & TL;DR
+
+- **作者 / Authors**: ...
+- **机构 / Affiliation**: ...
+- **会议·期刊 / Venue**: ...
+- **年份 / Year**: ...
+- **链接 / Link**: arXiv:xxxx.xxxxx / DOI:...
+- **领域 / Field**: [如：密码学协议 / 系统安全]
+- **TL;DR**: 一句话说清楚这篇论文做了什么、达到了什么效果（含保留的英文术语）
+
+## 2. 背景 / 问题 & 方法
+
+### 2.1 要解决什么问题
+- 问题、为什么重要、之前方法的不足
+- 用作者的 problem formulation 描述
+
+### 2.2 核心方法
+- 方法名（保留原文）
+- 关键步骤 / 架构组件（分点）
+- 关键公式或伪代码（**用 LaTeX 或代码块完整抄录**，不要意译）
+- 与已有方法的区别（vs. baseline X / vs. prior work Y）
+
+## 3. 实验与结果
+
+- **数据集 / 系统设置 / 评估场景**: ...
+- **基线 / Baselines**: ...
+- **主要指标**:
+  - 用表格或要点列出。**必须给出具体数值**，不要写"显著优于"
+  - 例：`方法 X: 84.3% 准确率, vs. baseline 81.7% (+2.6 pp)`
+- **重要消融**: 1-2 个最能说明问题的 ablation
+- **作者特别强调的发现**: 论文里 `we find that ...` 之后的话
+
+## 4. 创新点 · 局限 · 后续思考
+
+### 4.1 创新点 / Contributions
+- 1-3 条，**以作者声称的 contribution 为骨架**
+
+### 4.2 局限性 / Limitations
+- 作者自承的局限
+- 你看出来但作者没明说的，标 `(reviewer's note)`
+
+### 4.3 后续 / Future directions
+- 论文里提到的 future work
+- 你的研究 idea / 可追的引用 / 可复现性（代码/数据是否公开）
+
+---
+*Generated by paper-analyzer skill · 中文版*
+```
+
+### 英文版模板（完整英文，结构相同）
+
+```markdown
+# <Original English Title>
+
+> 📝 English version
+
+## 1. Metadata & TL;DR
+
+- **Authors**: ...
+- **Affiliation**: ...
+- **Venue**: ...
+- **Year**: ...
+- **Link**: arXiv:xxxx.xxxxx / DOI:...
+- **Field**: [e.g. Cryptographic protocols / System security]
+- **TL;DR**: One-sentence summary.
+
+## 2. Motivation & Method
+
+### 2.1 Problem
+- What problem, why it matters, prior limitations
+- Problem formulation in the author's terms
+
+### 2.2 Core Method
+- Method name
+- Key steps / architectural components
+- Key formulas or pseudocode (**transcribed verbatim**)
+- Differences vs. prior work
+
+## 3. Experiments & Results
+
+- **Datasets / setup**: ...
+- **Baselines**: ...
+- **Key metrics**:
+  - With **specific numbers**, not "significantly better"
+- **Ablations**: 1-2 informative ones
+- **Author-highlighted findings**
+
+## 4. Contributions · Limitations · Future Work
+
+### 4.1 Contributions
+- 1-3 bullets, framed around author's stated contributions
+
+### 4.2 Limitations
+- Author-acknowledged limitations
+- Your additional observations, marked `(reviewer's note)`
+
+### 4.3 Future Directions
+- From the paper
+- Your own research ideas / follow-up citations / reproducibility notes
+
+---
+*Generated by paper-analyzer skill · English version*
+```
+
+---
+
+## Step 5: 保存文件
+
+### 默认保存路径
+
+- 中文版：`<base>/<sanitized-title>.zh.md`
+- 英文版：`<base>/<sanitized-title>.en.md`
+- 默认 `<base>` = `./papers/`（当前工作目录下）
+
+### 路径可由用户配置
+
+按优先级查找：
+
+1. **本次会话用户明说的路径**（如"存到 ~/Obsidian/Papers"）→ 直接用
+2. **配置文件 `./paper-analyzer.config.json` 里的 `outputDir` 字段** → 用
+3. **用户主目录 `~/.paper-analyzer/config.json` 里的 `outputDir`** → 用
+4. **都没有** → 用默认 `./papers/`，**第一次保存时主动问一句**："默认保存到 `./papers/`，要改路径吗？如果想以后都用某个目录，告诉我我帮你写到 `~/.paper-analyzer/config.json`"
+
+配置文件示例：
+```json
+{
+  "outputDir": "~/Documents/papers"
+}
+```
+
+### 文件名规则
+- 取**英文标题**，去除特殊字符（`/\:*?"<>|`），空格换成 `-`，长度限 80 字符
+- 如果只有中文标题，用中文标题 + arxiv id（如有）
+- 重名加 `-2`、`-3` 后缀，**绝不覆盖**
+
+### 聊天里展示
+- 默认在聊天里**完整打印中文版**
+- 末尾提示："中文版已保存到 `<path>.zh.md`，英文版已保存到 `<path>.en.md`"
+- 如果用户明说想看英文，就打印英文版
+
+---
+
+## 关键写作规范
+
+下面这些是反复出问题的地方，请认真遵守：
+
+1. **数字必须精确**。论文表 3 里写 84.3 你就写 84.3，不要写"约 84%"、不要写"较高"。如果你没在原文找到数字，宁可空着写 `(N/A in paper)` 也不要编。
+
+2. **领域术语按 Step 2 的清单保留**。在中文版里：`Transformer` 不要翻译成"变压器"；`zero-knowledge proof` 不要翻译成"零知识证明"还可以但应在第一次出现时给出原文（如"零知识证明（zero-knowledge proof, ZKP）"），后续用 ZKP 即可。
+
+3. **不要把摘要复述当成方法理解**。Abstract 是销售文案，正文章节才是技术内容。如果你只看了摘要，**在两份版本的 TL;DR 后都明确加一行 `> ⚠️ 注：本总结仅基于摘要 / Based on abstract only`**。
+
+4. **作者声称 vs. 你的判断分开**。Contribution 用作者原话；局限性、后续 idea 是你的解读，用 `(reviewer's note)` 标明。
+
+5. **遇到不确定就停下来问**：
+   - PDF 是扫描件抽不出文字 → "这份 PDF 看起来是扫描件，我只能拿到 X 页，要继续吗？"
+   - 论文太长（>30 页，附录庞杂）→ "正文 + 附录都要分析吗？还是只看正文？"
+   - 用户只给标题，搜出来有多篇同名 → 列出来让用户选
+   - 领域不确定 → "这篇论文偏 X 还是 Y？我会按对应的术语保留惯例处理"
+
+---
+
+## 常见错误（不要犯）
+
+| 错误做法 | 为什么不行 |
+|---------|----------|
+| 用一段 200 字大段散文当"总结" | 用户没法快速 scan |
+| 给"准确率提高了"但没写具体数 | 笔记就废了 |
+| 中文意译方法名（Transformer→变压器，TEE→可信执行环境后不给原文） | 后续搜索/引用全要英文原文 |
+| 仅靠摘要却不声明，输出看起来像精读全文 | 严重误导用户 |
+| 把作者的局限和自己的吐槽混在一起 | 引用时分不清出处 |
+| 直接覆盖已有的 papers/xxx.md | 用户之前的笔记 + 自己批注就丢了 |
+| 只产出中文版没产出英文版（或反之） | 设计就是两份并存 |
+| 中英两版结构不一致 | 失去对照价值 |
+
+---
+
+## 示例：End-to-End Encrypted Git Services（密码学领域）
+
+**用户输入**：
+> 帮我读一下 `./End-to-End Encrypted Git Services.pdf`
+
+**应有的处理**：
+1. 用 PDF 抽取工具读全文
+2. 识别领域：密码学 + 系统安全（标题里有 Encrypted、Git，正文出现 commit、Merkle tree、authenticated encryption 等）
+3. 应用密码学术语保留规则：`E2EE`、`commit`、`Merkle tree`、`authenticated encryption`、`server-side push`、`zero-knowledge` 等保留英文
+4. 产出中文版和英文版两份
+5. 默认保存为：
+   - `./papers/End-to-End-Encrypted-Git-Services.zh.md`
+   - `./papers/End-to-End-Encrypted-Git-Services.en.md`
+6. 聊天里打印中文版完整内容 + 末尾告诉用户文件保存位置
+
+---
+
+## 输出前自检清单
+
+- [ ] 已识别论文领域，并在两份版本元信息里写明
+- [ ] 4 大节齐全，顺序没乱（两份版本结构一致）
+- [ ] 元信息：标题、作者、年份、链接都填了（不知道写 unknown，不猜）
+- [ ] 数字都是原文里的具体数值
+- [ ] 中文版里领域术语按 Step 2 的尺度保留了英文
+- [ ] 英文版整篇英文，不夹杂中文
+- [ ] 如果只基于摘要，已在 TL;DR 处加 `⚠️` 声明
+- [ ] 作者 contribution 和 reviewer note 分开了
+- [ ] 两份 `.md` 文件都已保存且文件名规范
+- [ ] 已告诉用户文件保存路径

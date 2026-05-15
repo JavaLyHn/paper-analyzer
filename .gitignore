@@ -1,0 +1,24 @@
+# Test paper PDFs (copyrighted, do not commit)
+*.pdf
+
+# Generated output
+papers/
+
+# Claude Code local-only settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
