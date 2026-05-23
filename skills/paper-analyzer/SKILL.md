@@ -567,6 +567,20 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
 | 翻译版的 figure 全堆在末尾不按引用位置嵌入 | 用户要回翻找位置，读起来累 |
 | 在 markdown 里写 `![](./figures/figure-7.png)` 但 figure-7.png 不存在 | 检查 manifest，论文没有就别假装有 |
 | 跳过资产抽取，让用户自己手动从 PDF 截图 | skill 就废了一半价值 |
+| **跑完 extract_assets.py 没看每张 figure-N.png** | 纯文字 figure（如协议步骤列表）的自动截图常失败，必须人眼检查 |
+| **生成 PPT 后没渲染 PNG 校验** | 见到 `✓ Saved` 就交付 → 模板/版式/截图任何一个错都漏过 |
+| **PPT 模板模式下用裸 textbox 覆盖** | 模板的装饰（logo / 色块 / 章节方块 / 曲线）就全废了。必须用 clone_slide 克隆样例 slide |
+| **以为模板的视觉在 layout 里** | 中文学术 / 企业模板把设计全画在样例 slide 上，layout 几乎空白。剥掉样例 slide = 剥掉所有视觉 |
+| **克隆 slide 时不重映射 rId** | logo 会静默消失（rId1 撞车）。必须把 r:embed / r:link / r:id 全 walk 一遍重写 |
+| **python-pptx 用 `add_relationship` 而不是 `get_or_add`** | 老教程的过时 API，会被 try/except 静默吞掉。导致看似"成功"但 rel 一个都没加 |
+| **PPT 版面字号随意，没有 type scale** | 一页里 5 种字号 = 业余。封面 36/章节 32/正文 22/图注 14，严格执行 |
+| **不设 east-asian typeface 让中文 fallback** | `font.name` 只设 latin。CJK 字符会掉回宋体默认。必须用 `<a:ea typeface="微软雅黑"/>` 显式设 |
+| **bullets 不设 anchor、不设 line_spacing** | 默认 anchor=TOP 导致 4 条 bullets 时挤在上半部分。20pt+ 需要 line_spacing 1.15 才不挤 |
+| **图片 add_picture(left, top, width, height) 强行拉伸** | 论文图等比都失真。必须先 PIL 读尺寸算缩放比，居中放入框 |
+| **PPT bullets 写 3-5 字干瘪要点（"性能优秀"）** | 那是 TL;DR 不是讲解 deck。每条 20-40 字、带具体数字 / 算法名 / 引文 |
+| **PPT 只生成 10-14 张 slide** | 论文 6-8 节 × 每节 2-3 张 = 20-30 张才正常。10 张说明你在偷懒 |
+| **content slide 标题用模板默认字号** | 28pt+ 长中英混标题必然换行掉到 body 区。必须强制 22pt + 占位符 ≥ 0.75 in 高 |
+| **PPT 局限性页混作者和 reviewer 观点** | 必须用 `[作者]` / `[reviewer]` 前缀分开 |
 | 给 PDF 输入却没跑 extract_assets.py | 等于丢掉图表那半儿 |
 | 用相对路径 `../figures/...`、绝对路径或 `~/...` 引用资产 | 笔记包不可移植 |
 
@@ -647,17 +661,24 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
 |------|------|----------|
 | 1 | `title` | 论文标题、作者、会议/期刊、年份 |
 | 2 | `section` | "背景与问题 / Background" |
-| 3 | `bullets` | 问题陈述 3-4 条 + 可选右侧图 |
-| 4 | `bullets` | 相关工作差距（可选） |
-| 5 | `section` | "方法 / Method" |
-| 6 | `bullets` | 核心方法概览 + 架构图 |
-| 7 | `image` | 方法示意图 / 系统架构图（单独一张） |
-| 8 | `formula` | 核心公式 + 一句解释 |
-| 9 | `section` | "实验与结果 / Experiments" |
-| 10 | `bullets` | 实验设置 + 基线 |
-| 11 | `image` | 结果表/图（嵌入 table-N.png 或 figure-N.png） |
-| 12 | `bullets` | 创新点 + 局限性 |
-| 13 | `closing` | "Thank You / Q&A" |
+| 3-5 | `bullets` × 2-3 | 问题陈述 / 现状不足 / 相关工作差距 |
+| 5 | `image` | 威胁模型 / 整体架构图 |
+| 6 | `section` | "方法 / Method" |
+| 7 | `bullets` | 设计目标 / 设计考量 |
+| 8 | `image` | 方法关键示意图 |
+| 9 | `bullets` | 协议步骤分解 |
+| 10 | `image` | 协议全图 |
+| 11 | `formula` | 核心公式 + 一句解释 |
+| 12 | `bullets` | 检测/验证算法说明（可带图） |
+| 13 | `section` | "安全性分析" 或 "实验评估 / Experiments" |
+| 14-15 | `bullets` | 安全模型 / 实验设置 |
+| 16-18 | `image` × 多张 | 关键结果图，每张一页 + 解读 caption |
+| 19 | `bullets` | 关键数值汇总 |
+| 20 | `section` | "讨论 · 局限 · 后续" |
+| 21-23 | `bullets` × 2-3 | 可用性 / Contributions / Limitations / Future |
+| 24 | `closing` | "Thank You / Q&A" |
+
+**slide 数量目标：20–30 张**。少于 15 张内容必然空泛；超过 35 张听众疲劳。每个一级章节配 2-4 张内容页 + 1 张分页。
 
 **JSON 格式**：
 
@@ -703,9 +724,98 @@ Automatically extracted by `extract_assets.py` (numbering follows the paper):
 }
 ```
 
-**写 bullets 的原则**：每条不超过 15 个字（中）或 12 个英文单词；用动词开头；幻灯片 ≠ Word 文档。**只嵌入 manifest.json 里确认存在的图**，不存在的留 `"figure": null`。
+**写 bullets 的原则**：
 
-**③ 运行脚本**
+- 每条 **20–40 个汉字** / **14–28 个英文单词**：短到能扫读、长到能承载真实信息。
+- **必须带具体数字 / 算法名 / 引用**（错例 "性能不错"；对例 "登录额外延迟 36 ± 8 ms"、对例 "Amnesia [Wang-Reiter USENIX'21] 也只解决 same-party detection"）。
+- 用动词或主语开头，但允许带子句解释。**不要纯标题党**。
+- 单页 bullets **5–7 条**最佳（脚本会自动 tighten 7+ 时的行距）；多于 8 条强制拆两页。
+- 涉及多步流程（如协议、算法）→ 每步一条 bullet，**别合并**。
+- 直接放论文里的真实数字（百分比、毫秒、GB、概率界）、定理名、算法名、引文 → 让 PPT 直接成为讲解骨架。
+- 局限性页用 `[作者]` / `[reviewer]` 前缀区分**作者自承的局限**和**你的额外观察**。
+
+**别只写 "TL;DR 风格"的 3-5 字干瘪要点**。听众要的是"够讲 60 秒"的密度，不是阅读后再回去翻论文。
+
+**只嵌入 manifest.json 里确认存在的图**，不存在的留 `"figure": null`。
+
+**📐 版面纪律（脚本已硬编码，但你必须懂规则）**
+
+整个 PPT 必须遵循下面这套类型尺度（type scale）和栅格（grid），否则就显得业余：
+
+**字号阶（point sizes）**：
+| 用途 | 字号 | 字重 |
+|---|---|---|
+| 封面标题 | **40 pt** | Bold |
+| 封面 byline（作者/会议/年份） | 18 pt | Regular |
+| 章节分页标题 | **30 pt** | Bold |
+| **Content slide 标题（强制显式，否则换行）** | **22 pt** | Bold |
+| 正文 bullet（单栏，无图） | 19 pt | Regular |
+| 正文 bullet（两栏，含图） | 16 pt | Regular |
+| 公式渲染 | 30 pt | Regular |
+| 公式 caption | 17 pt | Regular |
+| 图注 caption | 13 pt | Italic |
+| Closing "Thank You" | 44 pt | Bold |
+
+**字体**：中英文都明确指定，**不要让运行时挑**。中文用 `微软雅黑`（标题）+ `微软雅黑 Light`（byline/caption），英文用 `Arial`。如果模板的 theme 写明了别的字体，按 theme 来；脚本里的 `_apply_font()` 同时设置 latin 和 east-asian typeface。
+
+**栅格**：基于 16:9 (13.33×7.5 in)
+- 内容页 body 区域：上下 0.25 in gap from title / 0.50 in margin from bottom；左右继承标题占位符宽度（通常 0.6-0.7 in margin）。
+- **Content slide 标题占位符高度强制 ≥ 0.75 in**（模板默认常仅 0.5 in，长中英混标题会换 2 行掉到 body 区）。
+- 两栏（bullets + figure）：50/50 分割 + 0.35 in 中间间隔。
+- 图片：等比缩放居中放入 body 区域（绝不拉伸），caption 紧贴下方留 0.10 in gap + 0.5 in 高。
+- 公式：竖向居中于 body 区域，占 70% 高度，caption 占下方 0.8 in。
+
+**对齐**：
+- 封面标题：水平居中 + 垂直居中于色块上半部（55% 高），byline 居中于色块下半部（32% 高）。
+- 章节标题：水平左对齐到章节方块的左边界，竖向贴近方块下方 0.25 in。
+- 正文：标题继承模板占位符，bullets 顶对齐 + 左对齐。
+
+**bullet 间距**：行内 line spacing 1.15；行间 `space_after` 默认 = 字号的一半（22pt → 11pt）。
+
+**禁止**：
+- ❌ 用 `••` 自定义 bullet 符号——直接用 U+2022 `•` 加空格
+- ❌ 多字号混搭（一页里只能有一两种字号）
+- ❌ 不设定 east-asian typeface 让中文 fallback 成宋体
+- ❌ 图片用 add_picture 不等比缩放
+- ❌ 文字框 anchor 用默认 TOP 导致竖向偏上 / 偏下不一致
+
+**③ 模板使用的核心机制 —— 克隆样例 slide（脚本自动处理，但你必须懂）**
+
+⚠️ **`--template` 不是"借用 layout"，而是"克隆样例 slide"**。原因：
+
+中文学术 / 企业 PPT 模板（如北工大、清华、各类公司模板）的视觉设计 —— logo、配色色块、章节方块、装饰曲线、顶部蓝条 —— **几乎全部画在 4-6 张样例 slide 上**，不在 master / layout 里。master 大多接近空白。所以仅用 layout 渲染只会得到光秃秃的占位符，**模板视觉一点都没用上**。
+
+正确做法：把模板里现有的 slide 识别成"参考模板"，按 slide 类型 deep-clone 它们（连同所有装饰），再往克隆体上叠加 title / bullets / image。
+
+脚本里的 role 识别（`identify_references`）：
+
+- `cover` — 含 PICTURE 形状（logo）、无 GROUP（章节方块）的 slide。默认第一张。
+- `section` — 含 GROUP 形状（"01" 章节方块）的 slide。
+- `content` — 有 TITLE placeholder、无 GROUP 的 slide。
+- `closing` — 最后一张 section-style slide（"02"、"03"……号通常作为结尾）。
+
+脚本里的 slide-type → role 映射：
+
+- `title`   → 克隆 cover
+- `section` → 克隆 section，自动把 "01" 改成当前章节号
+- `bullets` → 克隆 content；可选 figure 走两栏布局
+- `image`   → 克隆 content；body 区域放等比缩放图片 + caption
+- `formula` → 克隆 content；body 区域放 matplotlib 渲染的公式 PNG
+- `closing` → 克隆 closing，badge 改成 "总章节数+1"
+
+克隆完所有新 slide 后，脚本删除模板原来的 4-6 张参考 slide。
+
+**已知坑 + 解法**（脚本里已修，写在这里给你解释为什么）：
+
+1. **rId 碰撞 → logo 消失**。最隐蔽也最致命的 bug。`prs.slides.add_slide(layout)` 给新 slide 自动分配 `rId1` 给 slide→layout 关系。原 cover 的 logo XML 引用 `rId1` 当图片，克隆后撞车，PowerPoint 静默把 logo 解析成 layout part → logo 不显示。
+   - 修法：克隆 XML 时**重映射 rId**。每个源 rel 通过 `Part.rels.get_or_add(reltype, target_part)` 加到新 slide（API 自动选下一个空闲 rId 并返回），然后用 `{old_rId: new_rId}` 映射表 walk 克隆出的 XML，把所有 `r:embed` / `r:link` / `r:id` 属性改写为新 rId。
+2. **python-pptx 没有 `add_relationship`，但很多教程里写它**。实际 API 是 `_Relationships.get_or_add()` 和 `get_or_add_ext_rel()`，写错名 + 用 try/except 会**静默吞掉错误**让你浑然不觉。一定要写 `print(...)` 才能发现。
+3. **"01" 章节方块的数字是写在 GROUP 内部的 TextFrame 里**。脚本递归遍历 GROUP 找到匹配 `^\d{1,3}$` 的 TextFrame，按当前章节号替换。如果模板用别的标识方式（如 "Chapter 1" 或图标），需要在 `_update_badge_number` 里扩展规则。
+4. **模板的样例 slide 不要用 zip 层暴力剥离**。前一版做法是预处理 zip、删 slide 文件后再交给 python-pptx — 这把整个模板的视觉设计也一起扔了。**现在的做法是保留它们当参考模板**，生成新 slide 后才一并删除。
+5. **图片放进 placeholder 会被 PowerPoint 拉伸填满**。脚本用 PIL 读原图尺寸做等比缩放再 `add_picture`，永不拉伸。
+6. **soffice / LibreOffice 字体替换**。模板里指定的字体如果 LibreOffice 没装，转 PDF 预览时会用 fallback 字体（常退化成手写体）。**在真正的 PowerPoint / Keynote / WPS 打开时会显示正确字体** —— 不要被 PDF 预览误导。如果用户在 Mac 上要做 PDF 导出，最好用 Keynote 或 PowerPoint 而非 soffice。
+
+**④ 运行脚本**
 
 ```bash
 # 无模板（内置学术主题）
@@ -715,7 +825,34 @@ python3 <skill-dir>/scripts/generate_slides.py <paper-dir>
 python3 <skill-dir>/scripts/generate_slides.py <paper-dir> --template /path/to/template.pptx
 ```
 
-**④ 告知用户**：保存路径、张数、是否套用了模板、公式是否渲染成功（需要 matplotlib）。
+**⑤ 跑完一定要可视化校验**（这是给你的硬性要求）：
+
+```bash
+# 转 PDF 然后渲染前几张 PNG 检查
+soffice --headless --convert-to pdf --outdir /tmp/check <paper-dir>/<output>.pptx
+python3 -c "import fitz; d=fitz.open('/tmp/check/<output>.pdf'); [d[i].get_pixmap(matrix=fitz.Matrix(1.5,1.5)).save(f'/tmp/check/s{i+1:02d}.png') for i in range(len(d))]"
+```
+
+然后用 Read 工具看 `/tmp/check/s01.png`、`s05.png`、几张 image slide。**任何一张明显挤压、图截不全、版式不对就改 slide-plan 或脚本重试**。不要看到 `✓ Saved` 就交付。
+
+**⑥ 关于 figure 截图（extract_assets.py 的已知失败模式）**
+
+抽图脚本对**没有 vector 边框、纯文字组成的 figure**（如 BnR 协议步骤列表）会失败 —— 这类 figure 没有 `page.get_drawings()` 矩形可定位，cropper 回退到文本块边界检测，常常把协议代码误判成"正文段落"而切掉。**处理方法**：
+
+1. 跑完 extract_assets.py 后，**用 Read 工具看每张 figure-N.png** —— 这是硬性步骤。
+2. 截不全的，**手动用 PyMuPDF 重截**：
+   ```python
+   import fitz
+   doc = fitz.open('<pdf>')
+   page = doc[<page_idx>]
+   # 用 page.get_text('blocks') 找正确的 bbox
+   rect = fitz.Rect(x0, y0, x1, y1)
+   pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72), clip=rect)
+   pix.save('<paper-dir>/figures/figure-N.png')
+   ```
+3. 重截后再生成 PPT。
+
+**⑦ 告知用户**：保存路径、张数、是否套用了模板、公式是否渲染成功，**以及哪些 figure 你手动重截过**。
 
 ---
 
@@ -735,6 +872,7 @@ python3 <skill-dir>/scripts/generate_slides.py <paper-dir> --template /path/to/t
 - [ ] 如果只基于摘要，三份输出顶部都加了 `⚠️` 声明
 - [ ] 作者 contribution 和 reviewer note 分开了
 - [ ] **若输入是 PDF：跑过 `extract_assets.py` 且 manifest 已存在**
+- [ ] **每张 figure-N.png 都用 Read 工具看过**，截不全的已手动重截
 - [ ] **markdown 里引用的 `figure-N.png` / `table-N.png` 都在 manifest 里能查到**
 - [ ] **所有资产引用用相对路径 `./figures/...`，不要绝对路径**
 - [ ] 三份 `.md` 文件都已保存到 `<base>/<title>/` 目录下
