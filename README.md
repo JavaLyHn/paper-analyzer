@@ -456,7 +456,7 @@ A: 模板要包含至少 4 张样例幻灯片（封面、章节、正文、封�
 
 ## 📄 License
 
-MIT — 看 `LICENSE` 文件（如果有），随便用，注明出处即可。
+GNU General Public License v3.0（GPL-3.0）— 见 `LICENSE` 文件。可自由使用 / 修改 / 二次发行，衍生作品须同样以 GPL-3.0 开源。
 
 ---
 
